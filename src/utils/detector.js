@@ -12,6 +12,9 @@ import {
     processSubscription 
 } from '../protocols/index.js';
 
+// [修复] 显式引入本地 js-yaml 库，确保打包时包含该库并在运行时可用
+import jsyaml from './js-yaml.min.js';
+
 /**
  * 自动检测并处理数据类型
  * @param {string} textData 原始文本数据
@@ -53,10 +56,11 @@ export function detectAndProcess(textData, uniqueStrings) {
             // 解码失败说明是纯文本或 YAML，继续处理
         }
         
-        // 检查全局作用域下的 jsyaml 是否存在（兼容原代码库粘贴模式）
-        // 如果使用了构建工具，建议在此处 import jsyaml from 'js-yaml'
-        if (typeof jsyaml !== 'undefined' && (processedText.includes('proxies:') || processedText.includes('proxy-groups:'))) {
+        // [修复] 直接使用引入的 jsyaml 变量，移除 typeof check
+        // 检测是否包含 YAML 特征关键字
+        if (processedText.includes('proxies:') || processedText.includes('proxy-groups:')) {
             try {
+                // 使用 jsyaml.load 解析
                 const yamlData = jsyaml.load(processedText);
                 if (yamlData && yamlData.proxies) {
                     processClash(yamlData, uniqueStrings);
