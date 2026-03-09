@@ -32,7 +32,6 @@ export default {
         const configPassword = kvPassword || envPassword || DEFAULT_SUPER_PASSWORD;
         
         // 3. 计算订阅路径 Token
-        // 逻辑：基于密码 + (可选)时间盐 + "sub" 字符串
         const expiryDays = parseInt(await getKV(env, "SUB_EXPIRY_DAYS") || "0", 10);
         let inputForHash = configPassword;
 
@@ -55,7 +54,6 @@ export default {
         }
 
         // --- 路由 2：管理后台配置页面 ---
-        // 访问条件：路径匹配 configPassword / 超级密码，或者未设密码时的根目录
         const isRootAdmin = (url.pathname === '/' && !hasUserSetPassword);
         const isPasswordAdmin = (currentPath === configPassword || currentPath === DEFAULT_SUPER_PASSWORD);
 
@@ -64,16 +62,58 @@ export default {
         }
 
         // --- 路由 3：反向代理与跳转逻辑 ---
-        // 只有在上述路径都不匹配时执行
         
-        // 优先级 A: 检查反代
+        // 优先级 A: 检查多行路由规则 (精确匹配路径前缀)
+        const routeRulesStr = await getKV(env, "ROUTE_RULES") || "";
+        if (routeRulesStr) {
+            const rules = routeRulesStr.split('\n').map(l => l.trim()).filter(l => l);
+            for (const rule of rules) {
+                const parts = rule.split(':');
+                if (parts.length >= 2) {
+                    const key = parts[0].trim();
+                    let target = parts.slice(1).join(':').trim();
+                    
+                    // 匹配路径前缀：完全匹配 /key 或以 /key/ 开头
+                    if (url.pathname === `/${key}` || url.pathname.startsWith(`/${key}/`)) {
+                        let keepPath = false; // 默认：普通网页，去路径
+                        
+                        // 解析前缀符号并决定是否保留路径
+                        if (target.startsWith('*')) {
+                            keepPath = true; // 纯节点，留路径
+                            target = target.substring(1);
+                        } else if (target.startsWith('^')) {
+                            // 智能混合：WS连节点(留路径)，HTTP看网页(去路径)
+                            const upgradeHeader = request.headers.get('Upgrade');
+                            const isWS = upgradeHeader && upgradeHeader.toLowerCase() === 'websocket';
+                            keepPath = isWS;
+                            target = target.substring(1);
+                        }
+                        
+                        // 覆盖目标域名
+                        url.hostname = target;
+                        
+                        // 如果是"去路径"模式，将前缀从 pathname 中剥离
+                        if (!keepPath) {
+                            url.pathname = url.pathname.substring(key.length + 1);
+                            if (!url.pathname.startsWith('/')) {
+                                url.pathname = '/' + url.pathname;
+                            }
+                        }
+                        
+                        return fetch(new Request(url, request));
+                    }
+                }
+            }
+        }
+
+        // 优先级 B: 全局兜底反代 (如果上述路由规则均未匹配)
         const proxyHost = await getKV(env, "PROXY_HOSTNAME") || env.HOSTNAME || ""; 
         if (proxyHost) {
             url.hostname = proxyHost;
             return fetch(new Request(url, request));
         }
 
-        // 优先级 B: 根目录跳转
+        // 优先级 C: 根目录跳转
         if (url.pathname === '/') {
             const redirectURL = await getKV(env, "ROOT_REDIRECT_URL") || "";
             if (redirectURL) {
@@ -85,7 +125,7 @@ export default {
             }
         }
         
-        // 优先级 C: 返回空白页
+        // 优先级 D: 返回空白页
         return new Response(null, { status: 204 });
     }
 };
