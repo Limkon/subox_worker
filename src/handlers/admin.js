@@ -130,7 +130,7 @@ export async function handleAdmin(request, env, configPassword, subToken) {
             
             <div class="input-group">
                 <label>路由规则 (ROUTE_RULES)</label>
-                <textarea name="route_rules" placeholder="agxtw: ^agxtw.pages.dev">${escapeHTML(routeRules)}</textarea>
+                <textarea name="route_rules" placeholder="">${escapeHTML(routeRules)}</textarea>
                 <small>
                     支持格式：<code>路径前缀: [符号]目标域名</code> 一行一个<br>
                     • <b>无符号</b>（去路径，普通网页）：<code>google: google.com</code><br>
