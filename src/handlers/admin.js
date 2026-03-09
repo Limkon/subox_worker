@@ -21,6 +21,7 @@ export async function handleAdmin(request, env, configPassword, subToken) {
         try {
             const formData = await request.formData();
             const newPassword = formData.get('password');
+            const newRouteRules = formData.get('route_rules');
             const newHostname = formData.get('hostname');
             const newSubListUrls = formData.get('sublist_urls'); 
             const newSubBlacklist = formData.get('sub_blacklist');
@@ -36,6 +37,7 @@ export async function handleAdmin(request, env, configPassword, subToken) {
 
             // 更新 KV 存储 (使用 putKV 会同时更新本地缓存)
             await putKV(env, "ADMIN_PASSWORD", newPassword);
+            await putKV(env, "ROUTE_RULES", newRouteRules || "");
             await putKV(env, "PROXY_HOSTNAME", newHostname || "");
             await putKV(env, "SUB_LIST_URLS", newSubListUrls || ""); 
             await putKV(env, "SUB_BLACKLIST", newSubBlacklist || "");
@@ -58,6 +60,7 @@ export async function handleAdmin(request, env, configPassword, subToken) {
     }
 
     // --- (B) 处理 GET 请求：返回 HTML 页面 ---
+    const routeRules = await getKV(env, "ROUTE_RULES") || "";
     const proxyHost = await getKV(env, "PROXY_HOSTNAME") || env.HOSTNAME || "";
     const subListUrls = await getKV(env, "SUB_LIST_URLS") || ''; 
     const subBlacklist = await getKV(env, "SUB_BLACKLIST") || ''; 
@@ -99,8 +102,8 @@ export async function handleAdmin(request, env, configPassword, subToken) {
         .input-group { margin-bottom: 1.5rem; }
         .input-group label { display: block; margin-bottom: 0.5rem; font-weight: 500; }
         .input-group input, .input-group textarea { width: 100%; padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-        .input-group textarea { font-family: monospace; min-height: 150px; }
-        .input-group small { display: block; margin-top: 0.5rem; color: #555; font-size: 0.85rem; }
+        .input-group textarea { font-family: monospace; min-height: 100px; }
+        .input-group small { display: block; margin-top: 0.5rem; color: #555; font-size: 0.85rem; line-height: 1.4; }
         .input-group-flex { display: flex; }
         .input-group-flex input { flex-grow: 1; border-top-right-radius: 0; border-bottom-right-radius: 0; background: #eee; }
         .copy-button { padding: 0.75rem; border: 1px solid #ddd; border-left: none; border-radius: 0 4px 4px 0; background: #f0f0f0; cursor: pointer; }
@@ -124,10 +127,23 @@ export async function handleAdmin(request, env, configPassword, subToken) {
                 <input type="number" name="sub_expiry_days" value="${escapeHTML(subExpiryDays)}" min="0">
                 <small>设为 0 表示永不自动轮换。</small>
             </div>
+            
             <div class="input-group">
-                <label>伪装域名 (PROXY_HOSTNAME)</label>
-                <input type="text" name="hostname" value="${escapeHTML(proxyHost)}" placeholder="留空以禁用反代">
+                <label>路由规则 (ROUTE_RULES)</label>
+                <textarea name="route_rules" placeholder="agxtw: ^agxtw.pages.dev">${escapeHTML(routeRules)}</textarea>
+                <small>
+                    支持格式：<code>路径前缀: [符号]目标域名</code> 一行一个<br>
+                    • <b>无符号</b>（去路径，普通网页）：<code>google: google.com</code><br>
+                    • <b>*</b>（留路径，纯节点）：<code>vps: *vps.com</code><br>
+                    • <b>^</b>（智能混合，HTTP去路径/WS留路径）：<code>ws: ^vps.com</code>
+                </small>
             </div>
+            
+            <div class="input-group">
+                <label>全局伪装域名兜底 (PROXY_HOSTNAME)</label>
+                <input type="text" name="hostname" value="${escapeHTML(proxyHost)}" placeholder="留空以禁用兜底反代（优先匹配上方路由规则）">
+            </div>
+            
             <div class="input-group">
                 <label>根目录跳转 (ROOT_REDIRECT_URL)</label>
                 <input type="text" name="root_redirect_url" value="${escapeHTML(rootRedirectURL)}" placeholder="https://example.com">
