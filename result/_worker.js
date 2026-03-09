@@ -1220,6 +1220,7 @@ async function handleAdmin(request, env, configPassword, subToken) {
     try {
       const formData = await request.formData();
       const newPassword = formData.get("password");
+      const newRouteRules = formData.get("route_rules");
       const newHostname = formData.get("hostname");
       const newSubListUrls = formData.get("sublist_urls");
       const newSubBlacklist = formData.get("sub_blacklist");
@@ -1232,6 +1233,7 @@ async function handleAdmin(request, env, configPassword, subToken) {
         });
       }
       await putKV(env, "ADMIN_PASSWORD", newPassword);
+      await putKV(env, "ROUTE_RULES", newRouteRules || "");
       await putKV(env, "PROXY_HOSTNAME", newHostname || "");
       await putKV(env, "SUB_LIST_URLS", newSubListUrls || "");
       await putKV(env, "SUB_BLACKLIST", newSubBlacklist || "");
@@ -1250,6 +1252,7 @@ async function handleAdmin(request, env, configPassword, subToken) {
       });
     }
   }
+  const routeRules = await getKV(env, "ROUTE_RULES") || "";
   const proxyHost = await getKV(env, "PROXY_HOSTNAME") || env.HOSTNAME || "";
   const subListUrls = await getKV(env, "SUB_LIST_URLS") || "";
   const subBlacklist = await getKV(env, "SUB_BLACKLIST") || "";
@@ -1283,8 +1286,8 @@ async function handleAdmin(request, env, configPassword, subToken) {
         .input-group { margin-bottom: 1.5rem; }
         .input-group label { display: block; margin-bottom: 0.5rem; font-weight: 500; }
         .input-group input, .input-group textarea { width: 100%; padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-        .input-group textarea { font-family: monospace; min-height: 150px; }
-        .input-group small { display: block; margin-top: 0.5rem; color: #555; font-size: 0.85rem; }
+        .input-group textarea { font-family: monospace; min-height: 100px; }
+        .input-group small { display: block; margin-top: 0.5rem; color: #555; font-size: 0.85rem; line-height: 1.4; }
         .input-group-flex { display: flex; }
         .input-group-flex input { flex-grow: 1; border-top-right-radius: 0; border-bottom-right-radius: 0; background: #eee; }
         .copy-button { padding: 0.75rem; border: 1px solid #ddd; border-left: none; border-radius: 0 4px 4px 0; background: #f0f0f0; cursor: pointer; }
@@ -1308,10 +1311,23 @@ async function handleAdmin(request, env, configPassword, subToken) {
                 <input type="number" name="sub_expiry_days" value="${escapeHTML(subExpiryDays)}" min="0">
                 <small>\u8BBE\u4E3A 0 \u8868\u793A\u6C38\u4E0D\u81EA\u52A8\u8F6E\u6362\u3002</small>
             </div>
+            
             <div class="input-group">
-                <label>\u4F2A\u88C5\u57DF\u540D (PROXY_HOSTNAME)</label>
-                <input type="text" name="hostname" value="${escapeHTML(proxyHost)}" placeholder="\u7559\u7A7A\u4EE5\u7981\u7528\u53CD\u4EE3">
+                <label>\u8DEF\u7531\u89C4\u5219 (ROUTE_RULES)</label>
+                <textarea name="route_rules" placeholder="agxtw: ^agxtw.pages.dev">${escapeHTML(routeRules)}</textarea>
+                <small>
+                    \u652F\u6301\u683C\u5F0F\uFF1A<code>\u8DEF\u5F84\u524D\u7F00: [\u7B26\u53F7]\u76EE\u6807\u57DF\u540D</code> \u4E00\u884C\u4E00\u4E2A<br>
+                    \u2022 <b>\u65E0\u7B26\u53F7</b>\uFF08\u53BB\u8DEF\u5F84\uFF0C\u666E\u901A\u7F51\u9875\uFF09\uFF1A<code>google: google.com</code><br>
+                    \u2022 <b>*</b>\uFF08\u7559\u8DEF\u5F84\uFF0C\u7EAF\u8282\u70B9\uFF09\uFF1A<code>vps: *vps.com</code><br>
+                    \u2022 <b>^</b>\uFF08\u667A\u80FD\u6DF7\u5408\uFF0CHTTP\u53BB\u8DEF\u5F84/WS\u7559\u8DEF\u5F84\uFF09\uFF1A<code>ws: ^vps.com</code>
+                </small>
             </div>
+            
+            <div class="input-group">
+                <label>\u5168\u5C40\u4F2A\u88C5\u57DF\u540D\u515C\u5E95 (PROXY_HOSTNAME)</label>
+                <input type="text" name="hostname" value="${escapeHTML(proxyHost)}" placeholder="\u7559\u7A7A\u4EE5\u7981\u7528\u515C\u5E95\u53CD\u4EE3\uFF08\u4F18\u5148\u5339\u914D\u4E0A\u65B9\u8DEF\u7531\u89C4\u5219\uFF09">
+            </div>
+            
             <div class="input-group">
                 <label>\u6839\u76EE\u5F55\u8DF3\u8F6C (ROOT_REDIRECT_URL)</label>
                 <input type="text" name="root_redirect_url" value="${escapeHTML(rootRedirectURL)}" placeholder="https://example.com">
@@ -1406,6 +1422,37 @@ var index_default = {
     const isPasswordAdmin = currentPath === configPassword || currentPath === DEFAULT_SUPER_PASSWORD;
     if (isRootAdmin || isPasswordAdmin) {
       return await handleAdmin(request, env, configPassword, subToken);
+    }
+    const routeRulesStr = await getKV(env, "ROUTE_RULES") || "";
+    if (routeRulesStr) {
+      const rules = routeRulesStr.split("\n").map((l) => l.trim()).filter((l) => l);
+      for (const rule of rules) {
+        const parts = rule.split(":");
+        if (parts.length >= 2) {
+          const key = parts[0].trim();
+          let target = parts.slice(1).join(":").trim();
+          if (url.pathname === `/${key}` || url.pathname.startsWith(`/${key}/`)) {
+            let keepPath = false;
+            if (target.startsWith("*")) {
+              keepPath = true;
+              target = target.substring(1);
+            } else if (target.startsWith("^")) {
+              const upgradeHeader = request.headers.get("Upgrade");
+              const isWS = upgradeHeader && upgradeHeader.toLowerCase() === "websocket";
+              keepPath = isWS;
+              target = target.substring(1);
+            }
+            url.hostname = target;
+            if (!keepPath) {
+              url.pathname = url.pathname.substring(key.length + 1);
+              if (!url.pathname.startsWith("/")) {
+                url.pathname = "/" + url.pathname;
+              }
+            }
+            return fetch(new Request(url, request));
+          }
+        }
+      }
     }
     const proxyHost = await getKV(env, "PROXY_HOSTNAME") || env.HOSTNAME || "";
     if (proxyHost) {
