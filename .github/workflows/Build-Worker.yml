@@ -3,7 +3,7 @@ name: Build Worker
 on:
   workflow_dispatch:
 
-# 强制 GitHub Actions 底层使用 Node.js 24 运行器
+# 新增：强制 GitHub Actions 底层使用 Node.js 24 运行器
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -21,7 +21,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24' # 同步升级构建环境到 24
+          node-version: '24' # 修改：将 node 版本从 20 升级为 24
 
       - name: Install dependencies
         run: npm install
