@@ -63,54 +63,112 @@ export default {
 
         // --- 路由 3：反向代理与跳转逻辑 ---
         
-        // 优先级 A: 检查多行路由规则 (精确匹配路径前缀)
+        // 优先级 A: 检查多行路由规则 (精确匹配路径前缀 + Referer 溯源)
         const routeRulesStr = await getKV(env, "ROUTE_RULES") || "";
         if (routeRulesStr) {
-            const rules = routeRulesStr.split('\n').map(l => l.trim()).filter(l => l);
-            for (const rule of rules) {
-                const parts = rule.split(':');
-                if (parts.length >= 2) {
-                    const key = parts[0].trim();
-                    let target = parts.slice(1).join(':').trim();
-                    
-                    // 匹配路径前缀：完全匹配 /key 或以 /key/ 开头
-                    if (url.pathname === `/${key}` || url.pathname.startsWith(`/${key}/`)) {
-                        let keepPath = false; // 默认：普通网页，去路径
-                        
-                        // 解析前缀符号并决定是否保留路径
-                        if (target.startsWith('*')) {
-                            keepPath = true; // 纯节点，留路径
-                            target = target.substring(1);
-                        } else if (target.startsWith('^')) {
-                            // 智能混合：WS连节点(留路径)，HTTP看网页(去路径)
-                            const upgradeHeader = request.headers.get('Upgrade');
-                            const isWS = upgradeHeader && upgradeHeader.toLowerCase() === 'websocket';
-                            keepPath = isWS;
-                            target = target.substring(1);
-                        }
-                        
-                        // 覆盖目标域名
-                        url.hostname = target;
-                        
-                        // 如果是"去路径"模式，将前缀从 pathname 中剥离
-                        if (!keepPath) {
-                            url.pathname = url.pathname.substring(key.length + 1);
-                            if (!url.pathname.startsWith('/')) {
-                                url.pathname = '/' + url.pathname;
+            // [性能优化]: 一次性解析所有有效规则，避免多次 split 浪费 CPU
+            const parsedRules = routeRulesStr.split('\n')
+                .map(l => l.trim())
+                .filter(l => l)
+                .map(rule => {
+                    const parts = rule.split(':');
+                    if (parts.length >= 2) {
+                        return {
+                            key: parts[0].trim(),
+                            target: parts.slice(1).join(':').trim()
+                        };
+                    }
+                    return null;
+                })
+                .filter(r => r !== null);
+
+            let matchedRule = null;
+            
+            // 1. 优先进行直接的路径匹配
+            for (const rule of parsedRules) {
+                if (url.pathname === `/${rule.key}` || url.pathname.startsWith(`/${rule.key}/`)) {
+                    matchedRule = { ...rule, fromReferer: false };
+                    break;
+                }
+            }
+
+            // 2. 如果直接匹配失败，尝试通过 Referer 进行溯源匹配
+            if (!matchedRule) {
+                const referer = request.headers.get('Referer');
+                if (referer) {
+                    try {
+                        const refererUrl = new URL(referer);
+                        for (const rule of parsedRules) {
+                            if (refererUrl.pathname === `/${rule.key}` || refererUrl.pathname.startsWith(`/${rule.key}/`)) {
+                                matchedRule = { ...rule, fromReferer: true };
+                                break;
                             }
                         }
-                        
-                        return fetch(new Request(url, request));
+                    } catch (e) {
+                        // Referer URL 解析错误忽略
                     }
                 }
+            }
+
+            // 3. 执行代理转发逻辑
+            if (matchedRule) {
+                const { key } = matchedRule;
+                let { target } = matchedRule;
+                let keepPath = false; 
+                
+                // 解析前缀符号并决定是否保留路径
+                if (target.startsWith('*')) {
+                    keepPath = true; // 纯节点，留路径
+                    target = target.substring(1);
+                } else if (target.startsWith('^')) {
+                    // 智能混合：WS连节点(留路径)，HTTP看网页(去路径)
+                    const upgradeHeader = request.headers.get('Upgrade');
+                    const isWS = upgradeHeader && upgradeHeader.toLowerCase() === 'websocket';
+                    keepPath = isWS;
+                    target = target.substring(1);
+                }
+                
+                // [Bug 修复]: 使用 url.host 以支持带有端口号的目标 (例如 example.com:8443)
+                url.host = target;
+                
+                // 去路径逻辑
+                if (!matchedRule.fromReferer && !keepPath) {
+                    url.pathname = url.pathname.substring(key.length + 1);
+                    if (!url.pathname.startsWith('/')) {
+                        url.pathname = '/' + url.pathname;
+                    }
+                }
+                
+                // [逻辑补全]: 覆写 Host 等请求头，防止目标服务器因 SNI/Host 不匹配而拒绝请求
+                const proxyHeaders = new Headers(request.headers);
+                proxyHeaders.set('Host', url.hostname); // Host 头部通常不带端口或由目标服务器自行处理
+                proxyHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+                
+                return fetch(new Request(url, {
+                    method: request.method,
+                    headers: proxyHeaders,
+                    body: request.body,
+                    redirect: 'manual'
+                }));
             }
         }
 
         // 优先级 B: 全局兜底反代 (如果上述路由规则均未匹配)
         const proxyHost = await getKV(env, "PROXY_HOSTNAME") || env.HOSTNAME || ""; 
         if (proxyHost) {
-            url.hostname = proxyHost;
-            return fetch(new Request(url, request));
+            // [Bug 修复]: 同上，替换 hostname 为 host
+            url.host = proxyHost;
+            
+            const proxyHeaders = new Headers(request.headers);
+            proxyHeaders.set('Host', url.hostname);
+            proxyHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+            
+            return fetch(new Request(url, {
+                method: request.method,
+                headers: proxyHeaders,
+                body: request.body,
+                redirect: 'manual'
+            }));
         }
 
         // 优先级 C: 根目录跳转
