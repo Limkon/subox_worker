@@ -3,10 +3,6 @@ name: Build Worker
 on:
   workflow_dispatch:
 
-# 新增：强制 GitHub Actions 底层使用 Node.js 24 运行器
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 permissions:
   contents: write
 
@@ -16,12 +12,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6   # ⬅️ 升级到 v6 (原生支持 Node 24，无警告)
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5 # ⬅️ 升级到 v5 (原生支持 Node 24，无警告)
         with:
-          node-version: '24' # 修改：将 node 版本从 20 升级为 24
+          node-version: '24'
 
       - name: Install dependencies
         run: npm install
@@ -30,19 +26,11 @@ jobs:
         run: npm run build
 
       - name: Move output to result
-        # 创建 result 目录并将 dist 中的文件移动过去，不再保留 dist 中的副本
         run: |
           mkdir -p result
           mv dist/_worker.js result/_worker.js
           cd result
           zip _worker.zip _worker.js
-
-    # - name: Upload worker artifact
-    #   uses: actions/upload-artifact@v4
-    #   with:
-    #     name: worker-script
-    #     path: result/_worker.js # 路径已更新为 result 目录
-    #     retention-days: 5
 
       - name: Commit and push result
         run: |
