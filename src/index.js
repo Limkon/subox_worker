@@ -7,130 +7,237 @@ import { sha1 } from './utils/helpers.js';
 import { handleSubscription } from './handlers/sub.js';
 import { handleAdmin } from './handlers/admin.js';
 
-export default {
-    /**
-     * Worker 总入口
-     * @param {Request} request 
-     * @param {object} env 
-     * @param {object} ctx 提供 waitUntil 等生命周期方法
-     */
-    async fetch(request, env, ctx) {
-        // --- 新增：全局缓存拦截 (方案一核心) ---
-        // 仅拦截 GET 请求，且基于完整 Request (URL) 进行匹配
-        let cache;
-        if (request.method === "GET") {
-            cache = caches.default;
-            const cachedResponse = await cache.match(request);
-            if (cachedResponse) {
-                // 命中缓存，0 KV 消耗，直接阻断后续所有逻辑返回结果
-                return cachedResponse; 
+// --- 一级缓存 (L1)：内存变量全局缓存 ---
+const kvMemoryCache = new Map();       // 专门缓存 KV 路由规则与配置 (L1)
+const responseMemoryCache = new Map(); // 专门缓存订阅和后台的响应体 (L1)
+const knownCacheKeys = new Set();      // 记录已写入 L2 缓存的 URL，用于精准清理
+
+// 安全基线配置
+const MAX_MEMORY_ITEMS = 100;          // 防止 Map 无限增长导致 OOM
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB 内存缓存阈值
+
+/**
+ * 内存容量熔断保护器
+ */
+function checkMemorySize() {
+    if (kvMemoryCache.size > MAX_MEMORY_ITEMS) kvMemoryCache.clear();
+    if (responseMemoryCache.size > MAX_MEMORY_ITEMS) responseMemoryCache.clear();
+    if (knownCacheKeys.size > MAX_MEMORY_ITEMS * 2) knownCacheKeys.clear();
+}
+
+/**
+ * 【规则配置缓存引擎】L1 (内存) + L2 (Cache API) 双重缓存 KV 读取
+ */
+async function getKVCachedL1L2(request, env, ctx, key) {
+    if (kvMemoryCache.has(key)) return kvMemoryCache.get(key);
+
+    const url = new URL(request.url);
+    const dummyUrlStr = `${url.origin}/__internal_kv_cache/${key}`;
+    const dummyReq = new Request(dummyUrlStr, { method: 'GET' });
+    const edgeCache = caches.default;
+
+    const l2Res = await edgeCache.match(dummyReq);
+    if (l2Res) {
+        const val = await l2Res.text();
+        checkMemorySize();
+        kvMemoryCache.set(key, val);
+        knownCacheKeys.add(dummyUrlStr);
+        return val;
+    }
+
+    const val = await getKV(env, key) || "";
+    checkMemorySize();
+    kvMemoryCache.set(key, val);
+
+    const cacheRes = new Response(val, { 
+        status: 200,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'max-age=31536000' }
+    });
+    ctx.waitUntil(edgeCache.put(dummyReq, cacheRes));
+    knownCacheKeys.add(dummyUrlStr);
+
+    return val;
+}
+
+/**
+ * 【防击穿引擎】L1 (内存) + L2 (Cache API) 双重缓存处理核心
+ */
+async function getResponseWithL1L2(request, ctx, fetcher) {
+    const urlObj = new URL(request.url);
+    // [修复1] 缓存键投毒防御：彻底抛弃 query 参数，仅使用纯净的 origin + pathname
+    const cleanUrlStr = urlObj.origin + urlObj.pathname;
+    const cacheReq = new Request(cleanUrlStr, { method: 'GET' });
+
+    // 1. L1 内存拦截
+    if (responseMemoryCache.has(cleanUrlStr)) {
+        const cachedData = responseMemoryCache.get(cleanUrlStr);
+        return new Response(cachedData.body, {
+            status: cachedData.status,
+            headers: new Headers(cachedData.headers)
+        });
+    }
+
+    // 2. L2 边缘节点拦截
+    const edgeCache = caches.default;
+    const l2Response = await edgeCache.match(cacheReq);
+    if (l2Response) {
+        // [修复3] L2 回读 OOM 防御：检查体积后再吸入内存
+        const contentLength = l2Response.headers.get('content-length');
+        if (!contentLength || parseInt(contentLength, 10) <= MAX_BODY_SIZE) {
+            try {
+                const cloned = l2Response.clone();
+                const bodyBuf = await cloned.arrayBuffer();
+                checkMemorySize(); // [修复2] 触发容量检查
+                responseMemoryCache.set(cleanUrlStr, {
+                    body: bodyBuf,
+                    status: l2Response.status,
+                    headers: Array.from(l2Response.headers.entries())
+                });
+            } catch (e) {
+                console.log(`L2 to L1 fallback error: ${e.message}`);
             }
         }
-        // ------------------------------------
+        knownCacheKeys.add(cleanUrlStr);
+        return l2Response;
+    }
 
-        // 1. 关键检查：验证 KV 绑定是否存在
+    // 3. 执行真实运算
+    const response = await fetcher();
+
+    // 4. 写入双重缓存
+    if (response && response.status === 200) {
+        const clonedForL1 = response.clone();
+        const clonedForL2 = response.clone();
+
+        ctx.waitUntil((async () => {
+            try {
+                const bodyBuf = await clonedForL1.arrayBuffer();
+                if (bodyBuf.byteLength <= MAX_BODY_SIZE) { 
+                    checkMemorySize(); // [修复2] 触发容量检查
+                    responseMemoryCache.set(cleanUrlStr, {
+                        body: bodyBuf,
+                        status: clonedForL1.status,
+                        headers: Array.from(clonedForL1.headers.entries())
+                    });
+                    knownCacheKeys.add(cleanUrlStr);
+                }
+            } catch (e) {}
+        })());
+
+        const cacheResponse = new Response(clonedForL2.body, clonedForL2);
+        cacheResponse.headers.set('Cache-Control', 'max-age=31536000');
+        ctx.waitUntil(edgeCache.put(cacheReq, cacheResponse));
+        knownCacheKeys.add(cleanUrlStr);
+    }
+
+    return response;
+}
+
+/**
+ * 统一清理缓存
+ */
+function clearAllCaches(ctx) {
+    kvMemoryCache.clear();
+    responseMemoryCache.clear();
+    
+    const edgeCache = caches.default;
+    for (const key of knownCacheKeys) {
+        try {
+            ctx.waitUntil(edgeCache.delete(new Request(key, { method: 'GET' })));
+        } catch (e) {}
+    }
+    knownCacheKeys.clear();
+}
+
+export default {
+    async fetch(request, env, ctx) {
+        const url = new URL(request.url);
+
+        // --- 核心安全锁：拦截外部恶意读取内部虚拟 KV 缓存 ---
+        if (url.pathname.startsWith('/__internal_kv_cache/')) {
+            return new Response("Forbidden: Internal Cache Path", { status: 403 });
+        }
+
         if (!env.host || typeof env.host.get !== 'function') {
             return new Response(
-                "配置错误：KV 命名空间 'host' 未正确绑定。\n" +
-                "请在 Cloudflare Worker 设置中添加名为 'host' 的 KV 绑定。",
+                "配置错误：KV 命名空间 'host' 未正确绑定。\n",
                 { status: 500, headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
             );
         }
         
-        const url = new URL(request.url);
-        
-        // 2. 密码获取逻辑 (优先级: KV > ENV > 默认超级密码)
-        const kvPassword = await getKV(env, "ADMIN_PASSWORD");
+        // --- 路由 0：手动强力清洗后门 ---
+        if (url.pathname === '/flush-cache') {
+            const providedPwd = url.searchParams.get('pwd');
+            const realPwd = await getKV(env, "ADMIN_PASSWORD") || env.password || DEFAULT_SUPER_PASSWORD; 
+            
+            if (providedPwd === realPwd) {
+                clearAllCaches(ctx);
+                return new Response("✅ 终极双重缓存架构已全部清洗完成！", {
+                    status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+                });
+            } else {
+                return new Response("❌ 权限不足", { status: 403, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+            }
+        }
+
+        // --- 全面启用 L1+L2 引擎获取配置 ---
+        const kvPassword = await getKVCachedL1L2(request, env, ctx, "ADMIN_PASSWORD");
         const envPassword = env.password; 
         const hasUserSetPassword = !!(kvPassword || envPassword);
-        
-        // configPassword 用于生成订阅 Token 及作为管理路径
         const configPassword = kvPassword || envPassword || DEFAULT_SUPER_PASSWORD;
         
-        // 3. 计算订阅路径 Token
-        const expiryDays = parseInt(await getKV(env, "SUB_EXPIRY_DAYS") || "0", 10);
+        const expiryDays = parseInt(await getKVCachedL1L2(request, env, ctx, "SUB_EXPIRY_DAYS") || "0", 10);
         let inputForHash = configPassword;
-
         if (expiryDays > 0) {
             const periodLengthMs = expiryDays * 86400000;
             const currentPeriod = Math.floor(Date.now() / periodLengthMs);
             inputForHash += String(currentPeriod);
         }
         inputForHash += "sub"; 
-        
         const hash = await sha1(inputForHash);
-        const subToken = hash.substring(0, 6); // 6位 Token
+        const subToken = hash.substring(0, 6);
         const subPath = "/" + subToken;
-        
         const currentPath = url.pathname.substring(1);
 
-        // --- 路由 1：订阅路径 (优先级最高) ---
+        // --- 路由 1：订阅路径 (全量 L1+L2 防击穿保护) ---
         if (url.pathname === subPath && request.method === "GET") { 
-            const subResponse = await handleSubscription(request, env, subToken);
-            
-            // --- 新增：将订阅结果写入缓存 ---
-            // 仅当成功获取到数据 (status 200) 时进行缓存，避免缓存错误信息
-            if (subResponse.status === 200 && cache) {
-                // 复制响应，并注入 Cache-Control 头
-                const responseToCache = new Response(subResponse.body, {
-                    status: subResponse.status,
-                    statusText: subResponse.statusText,
-                    headers: new Headers(subResponse.headers)
-                });
-                
-                // 设置缓存有效期为 300 秒 (5 分钟)
-                responseToCache.headers.set('Cache-Control', 'max-age=300');
-
-                // 使用 ctx.waitUntil 异步写入边缘缓存，不阻塞当前请求的响应返回给用户
-                ctx.waitUntil(cache.put(request, responseToCache.clone()));
-
-                return responseToCache;
-            }
-            // ------------------------------
-
-            return subResponse;
+            return await getResponseWithL1L2(request, ctx, () => handleSubscription(request, env, subToken));
         }
 
-        // --- 路由 2：管理后台配置页面 ---
+        // --- 路由 2：管理后台配置页面 (智能缓存刷新机制) ---
         const isRootAdmin = (url.pathname === '/' && !hasUserSetPassword);
         const isPasswordAdmin = (currentPath === configPassword || currentPath === DEFAULT_SUPER_PASSWORD);
 
         if (isRootAdmin || isPasswordAdmin) { 
-            return await handleAdmin(request, env, configPassword, subToken);
+            if (request.method === "GET") {
+                return await getResponseWithL1L2(request, ctx, () => handleAdmin(request, env, configPassword, subToken));
+            } else if (request.method === "POST") {
+                const adminResponse = await handleAdmin(request, env, configPassword, subToken);
+                if (adminResponse.status === 200) {
+                    clearAllCaches(ctx); 
+                }
+                return adminResponse;
+            }
         }
 
-        // --- 路由 3：反向代理与跳转逻辑 ---
-        
-        // 优先级 A: 检查多行路由规则 (精确匹配路径前缀 + Referer 溯源)
-        const routeRulesStr = await getKV(env, "ROUTE_RULES") || "";
+        // --- 路由 3：反向代理与跳转逻辑 (代理流量严格透传) ---
+        const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
-            // [性能优化]: 一次性解析所有有效规则，避免多次 split 浪费 CPU
             const parsedRules = routeRulesStr.split('\n')
                 .map(l => l.trim())
                 .filter(l => l)
                 .map(rule => {
                     const parts = rule.split(':');
-                    if (parts.length >= 2) {
-                        return {
-                            key: parts[0].trim(),
-                            target: parts.slice(1).join(':').trim()
-                        };
-                    }
+                    if (parts.length >= 2) return { key: parts[0].trim(), target: parts.slice(1).join(':').trim() };
                     return null;
-                })
-                .filter(r => r !== null);
+                }).filter(r => r !== null);
 
             let matchedRule = null;
-            
-            // 1. 优先进行直接的路径匹配
             for (const rule of parsedRules) {
                 if (url.pathname === `/${rule.key}` || url.pathname.startsWith(`/${rule.key}/`)) {
-                    matchedRule = { ...rule, fromReferer: false };
-                    break;
+                    matchedRule = { ...rule, fromReferer: false }; break;
                 }
             }
-
-            // 2. 如果直接匹配失败，尝试通过 Referer 进行溯源匹配
             if (!matchedRule) {
                 const referer = request.headers.get('Referer');
                 if (referer) {
@@ -138,90 +245,56 @@ export default {
                         const refererUrl = new URL(referer);
                         for (const rule of parsedRules) {
                             if (refererUrl.pathname === `/${rule.key}` || refererUrl.pathname.startsWith(`/${rule.key}/`)) {
-                                matchedRule = { ...rule, fromReferer: true };
-                                break;
+                                matchedRule = { ...rule, fromReferer: true }; break;
                             }
                         }
-                    } catch (e) {
-                        // Referer URL 解析错误忽略
-                    }
+                    } catch (e) {}
                 }
             }
 
-            // 3. 执行代理转发逻辑
             if (matchedRule) {
                 const { key } = matchedRule;
                 let { target } = matchedRule;
                 let keepPath = false; 
                 
-                // 解析前缀符号并决定是否保留路径
                 if (target.startsWith('*')) {
-                    keepPath = true; // 纯节点，留路径
-                    target = target.substring(1);
+                    keepPath = true; target = target.substring(1);
                 } else if (target.startsWith('^')) {
-                    // 智能混合：WS连节点(留路径)，HTTP看网页(去路径)
                     const upgradeHeader = request.headers.get('Upgrade');
                     const isWS = upgradeHeader && upgradeHeader.toLowerCase() === 'websocket';
-                    keepPath = isWS;
-                    target = target.substring(1);
+                    keepPath = isWS; target = target.substring(1);
                 }
                 
-                // [Bug 修复]: 使用 url.host 以支持带有端口号的目标 (例如 example.com:8443)
                 url.host = target;
-                
-                // 去路径逻辑
                 if (!matchedRule.fromReferer && !keepPath) {
                     url.pathname = url.pathname.substring(key.length + 1);
-                    if (!url.pathname.startsWith('/')) {
-                        url.pathname = '/' + url.pathname;
-                    }
+                    if (!url.pathname.startsWith('/')) url.pathname = '/' + url.pathname;
                 }
                 
-                // [逻辑补全]: 覆写 Host 等请求头，防止目标服务器因 SNI/Host 不匹配而拒绝请求
                 const proxyHeaders = new Headers(request.headers);
-                proxyHeaders.set('Host', url.hostname); // Host 头部通常不带端口或由目标服务器自行处理
+                proxyHeaders.set('Host', url.hostname); 
                 proxyHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
                 
-                return fetch(new Request(url, {
-                    method: request.method,
-                    headers: proxyHeaders,
-                    body: request.body,
-                    redirect: 'manual'
-                }));
+                return fetch(new Request(url, { method: request.method, headers: proxyHeaders, body: request.body, redirect: 'manual' }));
             }
         }
 
-        // 优先级 B: 全局兜底反代 (如果上述路由规则均未匹配)
-        const proxyHost = await getKV(env, "PROXY_HOSTNAME") || env.HOSTNAME || ""; 
+        // 优先级 B: 全局兜底反代
+        const proxyHost = await getKVCachedL1L2(request, env, ctx, "PROXY_HOSTNAME");
         if (proxyHost) {
-            // [Bug 修复]: 同上，替换 hostname 为 host
             url.host = proxyHost;
-            
             const proxyHeaders = new Headers(request.headers);
             proxyHeaders.set('Host', url.hostname);
             proxyHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-            
-            return fetch(new Request(url, {
-                method: request.method,
-                headers: proxyHeaders,
-                body: request.body,
-                redirect: 'manual'
-            }));
+            return fetch(new Request(url, { method: request.method, headers: proxyHeaders, body: request.body, redirect: 'manual' }));
         }
 
         // 优先级 C: 根目录跳转
-        if (url.pathname === '/') {
-            const redirectURL = await getKV(env, "ROOT_REDIRECT_URL") || "";
-            if (redirectURL) {
-                try {
-                    return Response.redirect(redirectURL, 302);
-                } catch (e) {
-                    console.log(`Invalid ROOT_REDIRECT_URL: ${e.message}`);
-                }
-            }
+        const redirectURL = await getKVCachedL1L2(request, env, ctx, "ROOT_REDIRECT_URL");
+        if (url.pathname === '/' && redirectURL) {
+            try { return Response.redirect(redirectURL, 302); } catch (e) { }
         }
         
-        // 优先级 D: 返回空白页
         return new Response(null, { status: 204 });
     }
 };
