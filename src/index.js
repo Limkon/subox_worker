@@ -10,8 +10,24 @@ import { handleAdmin } from './handlers/admin.js';
 export default {
     /**
      * Worker 总入口
+     * @param {Request} request 
+     * @param {object} env 
+     * @param {object} ctx 提供 waitUntil 等生命周期方法
      */
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
+        // --- 新增：全局缓存拦截 (方案一核心) ---
+        // 仅拦截 GET 请求，且基于完整 Request (URL) 进行匹配
+        let cache;
+        if (request.method === "GET") {
+            cache = caches.default;
+            const cachedResponse = await cache.match(request);
+            if (cachedResponse) {
+                // 命中缓存，0 KV 消耗，直接阻断后续所有逻辑返回结果
+                return cachedResponse; 
+            }
+        }
+        // ------------------------------------
+
         // 1. 关键检查：验证 KV 绑定是否存在
         if (!env.host || typeof env.host.get !== 'function') {
             return new Response(
@@ -50,7 +66,29 @@ export default {
 
         // --- 路由 1：订阅路径 (优先级最高) ---
         if (url.pathname === subPath && request.method === "GET") { 
-            return await handleSubscription(request, env, subToken);
+            const subResponse = await handleSubscription(request, env, subToken);
+            
+            // --- 新增：将订阅结果写入缓存 ---
+            // 仅当成功获取到数据 (status 200) 时进行缓存，避免缓存错误信息
+            if (subResponse.status === 200 && cache) {
+                // 复制响应，并注入 Cache-Control 头
+                const responseToCache = new Response(subResponse.body, {
+                    status: subResponse.status,
+                    statusText: subResponse.statusText,
+                    headers: new Headers(subResponse.headers)
+                });
+                
+                // 设置缓存有效期为 300 秒 (5 分钟)
+                responseToCache.headers.set('Cache-Control', 'max-age=300');
+
+                // 使用 ctx.waitUntil 异步写入边缘缓存，不阻塞当前请求的响应返回给用户
+                ctx.waitUntil(cache.put(request, responseToCache.clone()));
+
+                return responseToCache;
+            }
+            // ------------------------------
+
+            return subResponse;
         }
 
         // --- 路由 2：管理后台配置页面 ---
