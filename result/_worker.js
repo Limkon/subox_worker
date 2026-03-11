@@ -1387,23 +1387,141 @@ async function handleAdmin(request, env, configPassword, subToken) {
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
+var kvMemoryCache =   new Map();
+var responseMemoryCache =   new Map();
+var knownCacheKeys =   new Set();
+var MAX_MEMORY_ITEMS = 100;
+var MAX_BODY_SIZE = 10 * 1024 * 1024;
+function checkMemorySize() {
+  if (kvMemoryCache.size > MAX_MEMORY_ITEMS) kvMemoryCache.clear();
+  if (responseMemoryCache.size > MAX_MEMORY_ITEMS) responseMemoryCache.clear();
+  if (knownCacheKeys.size > MAX_MEMORY_ITEMS * 2) knownCacheKeys.clear();
+}
+async function getKVCachedL1L2(request, env, ctx, key) {
+  if (kvMemoryCache.has(key)) return kvMemoryCache.get(key);
+  const url = new URL(request.url);
+  const dummyUrlStr = `${url.origin}/__internal_kv_cache/${key}`;
+  const dummyReq = new Request(dummyUrlStr, { method: "GET" });
+  const edgeCache = caches.default;
+  const l2Res = await edgeCache.match(dummyReq);
+  if (l2Res) {
+    const val2 = await l2Res.text();
+    checkMemorySize();
+    kvMemoryCache.set(key, val2);
+    knownCacheKeys.add(dummyUrlStr);
+    return val2;
+  }
+  const val = await getKV(env, key) || "";
+  checkMemorySize();
+  kvMemoryCache.set(key, val);
+  const cacheRes = new Response(val, {
+    status: 200,
+    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "max-age=31536000" }
+  });
+  ctx.waitUntil(edgeCache.put(dummyReq, cacheRes));
+  knownCacheKeys.add(dummyUrlStr);
+  return val;
+}
+async function getResponseWithL1L2(request, ctx, fetcher) {
+  const urlObj = new URL(request.url);
+  const cleanUrlStr = urlObj.origin + urlObj.pathname;
+  const cacheReq = new Request(cleanUrlStr, { method: "GET" });
+  if (responseMemoryCache.has(cleanUrlStr)) {
+    const cachedData = responseMemoryCache.get(cleanUrlStr);
+    return new Response(cachedData.body, {
+      status: cachedData.status,
+      headers: new Headers(cachedData.headers)
+    });
+  }
+  const edgeCache = caches.default;
+  const l2Response = await edgeCache.match(cacheReq);
+  if (l2Response) {
+    const contentLength = l2Response.headers.get("content-length");
+    if (!contentLength || parseInt(contentLength, 10) <= MAX_BODY_SIZE) {
+      try {
+        const cloned = l2Response.clone();
+        const bodyBuf = await cloned.arrayBuffer();
+        checkMemorySize();
+        responseMemoryCache.set(cleanUrlStr, {
+          body: bodyBuf,
+          status: l2Response.status,
+          headers: Array.from(l2Response.headers.entries())
+        });
+      } catch (e) {
+        void(0);
+      }
+    }
+    knownCacheKeys.add(cleanUrlStr);
+    return l2Response;
+  }
+  const response = await fetcher();
+  if (response && response.status === 200) {
+    const clonedForL1 = response.clone();
+    const clonedForL2 = response.clone();
+    ctx.waitUntil((async () => {
+      try {
+        const bodyBuf = await clonedForL1.arrayBuffer();
+        if (bodyBuf.byteLength <= MAX_BODY_SIZE) {
+          checkMemorySize();
+          responseMemoryCache.set(cleanUrlStr, {
+            body: bodyBuf,
+            status: clonedForL1.status,
+            headers: Array.from(clonedForL1.headers.entries())
+          });
+          knownCacheKeys.add(cleanUrlStr);
+        }
+      } catch (e) {
+      }
+    })());
+    const cacheResponse = new Response(clonedForL2.body, clonedForL2);
+    cacheResponse.headers.set("Cache-Control", "max-age=31536000");
+    ctx.waitUntil(edgeCache.put(cacheReq, cacheResponse));
+    knownCacheKeys.add(cleanUrlStr);
+  }
+  return response;
+}
+function clearAllCaches(ctx) {
+  kvMemoryCache.clear();
+  responseMemoryCache.clear();
+  const edgeCache = caches.default;
+  for (const key of knownCacheKeys) {
+    try {
+      ctx.waitUntil(edgeCache.delete(new Request(key, { method: "GET" })));
+    } catch (e) {
+    }
+  }
+  knownCacheKeys.clear();
+}
 var index_default = {
-  
-
- 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/__internal_kv_cache/")) {
+      return new Response("Forbidden: Internal Cache Path", { status: 403 });
+    }
     if (!env.host || typeof env.host.get !== "function") {
       return new Response(
-        "\u914D\u7F6E\u9519\u8BEF\uFF1AKV \u547D\u540D\u7A7A\u95F4 'host' \u672A\u6B63\u786E\u7ED1\u5B9A\u3002\n\u8BF7\u5728 Cloudflare Worker \u8BBE\u7F6E\u4E2D\u6DFB\u52A0\u540D\u4E3A 'host' \u7684 KV \u7ED1\u5B9A\u3002",
+        "\u914D\u7F6E\u9519\u8BEF\uFF1AKV \u547D\u540D\u7A7A\u95F4 'host' \u672A\u6B63\u786E\u7ED1\u5B9A\u3002\n",
         { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } }
       );
     }
-    const url = new URL(request.url);
-    const kvPassword = await getKV(env, "ADMIN_PASSWORD");
+    if (url.pathname === "/flush-cache") {
+      const providedPwd = url.searchParams.get("pwd");
+      const realPwd = await getKV(env, "ADMIN_PASSWORD") || env.password || DEFAULT_SUPER_PASSWORD;
+      if (providedPwd === realPwd) {
+        clearAllCaches(ctx);
+        return new Response("\u2705 \u7EC8\u6781\u53CC\u91CD\u7F13\u5B58\u67B6\u6784\u5DF2\u5168\u90E8\u6E05\u6D17\u5B8C\u6210\uFF01", {
+          status: 200,
+          headers: { "Content-Type": "text/plain; charset=utf-8" }
+        });
+      } else {
+        return new Response("\u274C \u6743\u9650\u4E0D\u8DB3", { status: 403, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+      }
+    }
+    const kvPassword = await getKVCachedL1L2(request, env, ctx, "ADMIN_PASSWORD");
     const envPassword = env.password;
     const hasUserSetPassword = !!(kvPassword || envPassword);
     const configPassword = kvPassword || envPassword || DEFAULT_SUPER_PASSWORD;
-    const expiryDays = parseInt(await getKV(env, "SUB_EXPIRY_DAYS") || "0", 10);
+    const expiryDays = parseInt(await getKVCachedL1L2(request, env, ctx, "SUB_EXPIRY_DAYS") || "0", 10);
     let inputForHash = configPassword;
     if (expiryDays > 0) {
       const periodLengthMs = expiryDays * 864e5;
@@ -1416,23 +1534,26 @@ var index_default = {
     const subPath = "/" + subToken;
     const currentPath = url.pathname.substring(1);
     if (url.pathname === subPath && request.method === "GET") {
-      return await handleSubscription(request, env, subToken);
+      return await getResponseWithL1L2(request, ctx, () => handleSubscription(request, env, subToken));
     }
     const isRootAdmin = url.pathname === "/" && !hasUserSetPassword;
     const isPasswordAdmin = currentPath === configPassword || currentPath === DEFAULT_SUPER_PASSWORD;
     if (isRootAdmin || isPasswordAdmin) {
-      return await handleAdmin(request, env, configPassword, subToken);
+      if (request.method === "GET") {
+        return await getResponseWithL1L2(request, ctx, () => handleAdmin(request, env, configPassword, subToken));
+      } else if (request.method === "POST") {
+        const adminResponse = await handleAdmin(request, env, configPassword, subToken);
+        if (adminResponse.status === 200) {
+          clearAllCaches(ctx);
+        }
+        return adminResponse;
+      }
     }
-    const routeRulesStr = await getKV(env, "ROUTE_RULES") || "";
+    const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
     if (routeRulesStr) {
       const parsedRules = routeRulesStr.split("\n").map((l) => l.trim()).filter((l) => l).map((rule) => {
         const parts = rule.split(":");
-        if (parts.length >= 2) {
-          return {
-            key: parts[0].trim(),
-            target: parts.slice(1).join(":").trim()
-          };
-        }
+        if (parts.length >= 2) return { key: parts[0].trim(), target: parts.slice(1).join(":").trim() };
         return null;
       }).filter((r) => r !== null);
       let matchedRule = null;
@@ -1473,42 +1594,27 @@ var index_default = {
         url.host = target;
         if (!matchedRule.fromReferer && !keepPath) {
           url.pathname = url.pathname.substring(key.length + 1);
-          if (!url.pathname.startsWith("/")) {
-            url.pathname = "/" + url.pathname;
-          }
+          if (!url.pathname.startsWith("/")) url.pathname = "/" + url.pathname;
         }
         const proxyHeaders = new Headers(request.headers);
         proxyHeaders.set("Host", url.hostname);
         proxyHeaders.set("X-Forwarded-Proto", url.protocol.replace(":", ""));
-        return fetch(new Request(url, {
-          method: request.method,
-          headers: proxyHeaders,
-          body: request.body,
-          redirect: "manual"
-        }));
+        return fetch(new Request(url, { method: request.method, headers: proxyHeaders, body: request.body, redirect: "manual" }));
       }
     }
-    const proxyHost = await getKV(env, "PROXY_HOSTNAME") || env.HOSTNAME || "";
+    const proxyHost = await getKVCachedL1L2(request, env, ctx, "PROXY_HOSTNAME");
     if (proxyHost) {
       url.host = proxyHost;
       const proxyHeaders = new Headers(request.headers);
       proxyHeaders.set("Host", url.hostname);
       proxyHeaders.set("X-Forwarded-Proto", url.protocol.replace(":", ""));
-      return fetch(new Request(url, {
-        method: request.method,
-        headers: proxyHeaders,
-        body: request.body,
-        redirect: "manual"
-      }));
+      return fetch(new Request(url, { method: request.method, headers: proxyHeaders, body: request.body, redirect: "manual" }));
     }
-    if (url.pathname === "/") {
-      const redirectURL = await getKV(env, "ROOT_REDIRECT_URL") || "";
-      if (redirectURL) {
-        try {
-          return Response.redirect(redirectURL, 302);
-        } catch (e) {
-          void(0);
-        }
+    const redirectURL = await getKVCachedL1L2(request, env, ctx, "ROOT_REDIRECT_URL");
+    if (url.pathname === "/" && redirectURL) {
+      try {
+        return Response.redirect(redirectURL, 302);
+      } catch (e) {
       }
     }
     return new Response(null, { status: 204 });
