@@ -12,6 +12,10 @@ const kvMemoryCache = new Map();       // 专门缓存 KV 路由规则与配置 
 const responseMemoryCache = new Map(); // 专门缓存订阅和后台的响应体 (L1)
 const knownCacheKeys = new Set();      // 记录已写入 L2 缓存的 URL，用于精准清理
 
+// --- 路由规则解析缓存 (CPU 优化核心) ---
+let parsedRulesCache = null;           // 缓存解析后的路由规则数组
+let lastRouteRulesStr = null;          // 记录上次解析的路由规则字符串
+
 // 安全基线配置
 const MAX_MEMORY_ITEMS = 100;          // 防止 Map 无限增长导致 OOM
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB 内存缓存阈值
@@ -140,6 +144,10 @@ function clearAllCaches(ctx) {
     kvMemoryCache.clear();
     responseMemoryCache.clear();
     
+    // 【性能优化】同步清理路由解析缓存，确保下次请求重新解析最新规则
+    parsedRulesCache = null;
+    lastRouteRulesStr = null;
+    
     const edgeCache = caches.default;
     for (const key of knownCacheKeys) {
         try {
@@ -223,17 +231,22 @@ export default {
         // --- 路由 3：反向代理与跳转逻辑 (代理流量严格透传) ---
         const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
-            const parsedRules = routeRulesStr.split('\n')
-                .map(l => l.trim())
-                .filter(l => l)
-                .map(rule => {
-                    const parts = rule.split(':');
-                    if (parts.length >= 2) return { key: parts[0].trim(), target: parts.slice(1).join(':').trim() };
-                    return null;
-                }).filter(r => r !== null);
+            // 【CPU 性能优化核心】避免每次请求重复进行耗时的字符串切割与正则操作
+            if (routeRulesStr !== lastRouteRulesStr || !parsedRulesCache) {
+                parsedRulesCache = routeRulesStr.split('\n')
+                    .map(l => l.trim())
+                    .filter(l => l)
+                    .map(rule => {
+                        const parts = rule.split(':');
+                        if (parts.length >= 2) return { key: parts[0].trim(), target: parts.slice(1).join(':').trim() };
+                        return null;
+                    }).filter(r => r !== null);
+                lastRouteRulesStr = routeRulesStr;
+            }
 
             let matchedRule = null;
-            for (const rule of parsedRules) {
+            // 直接读取内存中已解析完成的对象数组进行 O(N) 极速匹配
+            for (const rule of parsedRulesCache) {
                 if (url.pathname === `/${rule.key}` || url.pathname.startsWith(`/${rule.key}/`)) {
                     matchedRule = { ...rule, fromReferer: false }; break;
                 }
@@ -243,7 +256,7 @@ export default {
                 if (referer) {
                     try {
                         const refererUrl = new URL(referer);
-                        for (const rule of parsedRules) {
+                        for (const rule of parsedRulesCache) {
                             if (refererUrl.pathname === `/${rule.key}` || refererUrl.pathname.startsWith(`/${rule.key}/`)) {
                                 matchedRule = { ...rule, fromReferer: true }; break;
                             }
