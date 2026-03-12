@@ -97,8 +97,13 @@ export async function handleAdmin(request, env, configPassword, subToken) {
     <title>参数配置</title>
     <style>
         body { font-family: -apple-system, system-ui, sans-serif; background-color: #f0f2f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; box-sizing: border-box; color: #333; }
-        .container { background: #fff; padding: 2.5rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 100%; max-width: 600px; }
-        h2 { text-align: center; margin-bottom: 2rem; }
+        .container { background: #fff; padding: 2.5rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 100%; max-width: 600px; position: relative; }
+        h2 { text-align: center; margin-bottom: 2rem; margin-top: 0; }
+        
+        /* 清理缓存按钮样式 */
+        .btn-clean { position: absolute; top: 2.2rem; right: 2.5rem; background-color: #ff4d4f; color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; font-size: 0.9rem; font-weight: 600; transition: background-color 0.2s; box-shadow: 0 2px 4px rgba(255, 77, 79, 0.2); }
+        .btn-clean:hover { background-color: #ff7875; }
+
         .input-group { margin-bottom: 1.5rem; }
         .input-group label { display: block; margin-bottom: 0.5rem; font-weight: 500; }
         .input-group input, .input-group textarea { width: 100%; padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
@@ -115,6 +120,8 @@ export async function handleAdmin(request, env, configPassword, subToken) {
 </head>
 <body>
     <div class="container">
+        <button type="button" id="flush-cache-btn" class="btn-clean">清理缓存</button>
+        
         <h2>KV 参数配置</h2>
         <form id="config-form">
             <div class="input-group">
@@ -169,6 +176,7 @@ export async function handleAdmin(request, env, configPassword, subToken) {
         <div id="status"></div>
     </div>
     <script>
+        // 表单保存逻辑
         document.getElementById('config-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             const status = document.getElementById('status');
@@ -192,11 +200,42 @@ export async function handleAdmin(request, env, configPassword, subToken) {
                 }
             } catch (err) { status.textContent = '错误: ' + err.message; }
         });
+        
+        // 复制按钮逻辑
         document.getElementById('copy-btn').onclick = function() {
             navigator.clipboard.writeText(document.getElementById('sub-url').value);
             this.textContent = '已复制';
             setTimeout(() => this.textContent = '复制', 2000);
         };
+        
+        // 清理缓存按钮逻辑
+        document.getElementById('flush-cache-btn').addEventListener('click', async function() {
+            const pass = document.getElementById('password').value;
+            if (!pass) {
+                alert('请先在下方输入管理密码，再执行清理缓存操作！');
+                return;
+            }
+            if (!confirm('确定要强力清理所有系统缓存吗？')) return;
+            
+            const status = document.getElementById('status');
+            status.textContent = '正在发起清理请求...';
+            status.className = '';
+            
+            try {
+                const res = await fetch('/flush-cache?pwd=' + encodeURIComponent(pass));
+                const text = await res.text();
+                if (res.status === 200) {
+                    status.className = 'status-success';
+                    status.textContent = text;
+                } else {
+                    status.className = 'status-error';
+                    status.textContent = '清理失败: ' + text;
+                }
+            } catch (err) {
+                status.className = 'status-error';
+                status.textContent = '请求错误: ' + err.message;
+            }
+        });
     </script>
 </body>
 </html>`;
