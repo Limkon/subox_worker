@@ -1429,6 +1429,8 @@ async function handleAdmin(request, env, configPassword, subToken) {
 var kvMemoryCache =   new Map();
 var responseMemoryCache =   new Map();
 var knownCacheKeys =   new Set();
+var parsedRulesCache = null;
+var lastRouteRulesStr = null;
 var MAX_MEMORY_ITEMS = 100;
 var MAX_BODY_SIZE = 10 * 1024 * 1024;
 function checkMemorySize() {
@@ -1522,6 +1524,8 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
 function clearAllCaches(ctx) {
   kvMemoryCache.clear();
   responseMemoryCache.clear();
+  parsedRulesCache = null;
+  lastRouteRulesStr = null;
   const edgeCache = caches.default;
   for (const key of knownCacheKeys) {
     try {
@@ -1590,13 +1594,16 @@ var index_default = {
     }
     const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
     if (routeRulesStr) {
-      const parsedRules = routeRulesStr.split("\n").map((l) => l.trim()).filter((l) => l).map((rule) => {
-        const parts = rule.split(":");
-        if (parts.length >= 2) return { key: parts[0].trim(), target: parts.slice(1).join(":").trim() };
-        return null;
-      }).filter((r) => r !== null);
+      if (routeRulesStr !== lastRouteRulesStr || !parsedRulesCache) {
+        parsedRulesCache = routeRulesStr.split("\n").map((l) => l.trim()).filter((l) => l).map((rule) => {
+          const parts = rule.split(":");
+          if (parts.length >= 2) return { key: parts[0].trim(), target: parts.slice(1).join(":").trim() };
+          return null;
+        }).filter((r) => r !== null);
+        lastRouteRulesStr = routeRulesStr;
+      }
       let matchedRule = null;
-      for (const rule of parsedRules) {
+      for (const rule of parsedRulesCache) {
         if (url.pathname === `/${rule.key}` || url.pathname.startsWith(`/${rule.key}/`)) {
           matchedRule = { ...rule, fromReferer: false };
           break;
@@ -1607,7 +1614,7 @@ var index_default = {
         if (referer) {
           try {
             const refererUrl = new URL(referer);
-            for (const rule of parsedRules) {
+            for (const rule of parsedRulesCache) {
               if (refererUrl.pathname === `/${rule.key}` || refererUrl.pathname.startsWith(`/${rule.key}/`)) {
                 matchedRule = { ...rule, fromReferer: true };
                 break;
