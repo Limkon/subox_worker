@@ -271,11 +271,12 @@ export default {
                     if (!url.pathname.startsWith('/')) url.pathname = '/' + url.pathname;
                 }
                 
-                const proxyHeaders = new Headers(request.headers);
-                proxyHeaders.set('Host', url.hostname); 
-                proxyHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+                // 【修复核心 1：利用原生 request 保持 Zero-Copy 流式传输】
+                const proxyRequest = new Request(url, request);
+                proxyRequest.headers.set('Host', url.hostname); 
+                proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
                 
-                return fetch(new Request(url, { method: request.method, headers: proxyHeaders, body: request.body, redirect: 'manual' }));
+                return fetch(proxyRequest, { redirect: 'manual' });
             }
         }
 
@@ -283,10 +284,12 @@ export default {
         const proxyHost = await getKVCachedL1L2(request, env, ctx, "PROXY_HOSTNAME");
         if (proxyHost) {
             url.host = proxyHost;
-            const proxyHeaders = new Headers(request.headers);
-            proxyHeaders.set('Host', url.hostname);
-            proxyHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-            return fetch(new Request(url, { method: request.method, headers: proxyHeaders, body: request.body, redirect: 'manual' }));
+            // 【修复核心 2：兜底逻辑同理，防止大文件/WebSocket/代理协议中断和掉速】
+            const proxyRequest = new Request(url, request);
+            proxyRequest.headers.set('Host', url.hostname);
+            proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+            
+            return fetch(proxyRequest, { redirect: 'manual' });
         }
 
         // 优先级 C: 根目录跳转
