@@ -12,12 +12,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6   # ⬅️ 升级到 v6 (原生支持 Node 24，无警告)
+        uses: actions/checkout@main   # ⬅️ 升级到 v6 (原生支持 Node 24，无警告)
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5 # ⬅️ 升级到 v5 (原生支持 Node 24，无警告)
+        uses: actions/setup-node@main # ⬅️ 升级到 v5 (原生支持 Node 24，无警告)
         with:
-          node-version: '24'
+          node-version: 'x'
 
       - name: Install dependencies
         run: npm install
