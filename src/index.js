@@ -10,7 +10,7 @@ import { handleAdmin } from './handlers/admin.js';
 // --- 一级缓存 (L1)：内存变量全局缓存 ---
 const kvMemoryCache = new Map();       // 专门缓存 KV 路由规则与配置 (L1)
 const responseMemoryCache = new Map(); // 专门缓存订阅和后台的响应体 (L1)
-const knownCacheKeys = new Set();      // 记录已写入 L2 缓存的 URL，用于精准清理
+const knownCacheKeys = new Set();      // 记录已写入 L2 缓存的动态 URL（订阅与页面响应）
 
 // --- 路由规则解析缓存 (CPU 优化核心) ---
 let parsedRulesCache = null;           // 缓存解析后的路由规则数组
@@ -35,8 +35,8 @@ function checkMemorySize() {
 async function getKVCachedL1L2(request, env, ctx, key) {
     if (kvMemoryCache.has(key)) return kvMemoryCache.get(key);
 
-    const url = new URL(request.url);
-    const dummyUrlStr = `${url.origin}/__internal_kv_cache/${key}`;
+    // [修复] 缓存穿透与碎片化：使用固定虚拟域名，保证多域名入口共用同一份配置缓存
+    const dummyUrlStr = `http://internal-config.local/__internal_kv_cache/${key}`;
     const dummyReq = new Request(dummyUrlStr, { method: 'GET' });
     const edgeCache = caches.default;
 
@@ -45,7 +45,6 @@ async function getKVCachedL1L2(request, env, ctx, key) {
         const val = await l2Res.text();
         checkMemorySize();
         kvMemoryCache.set(key, val);
-        knownCacheKeys.add(dummyUrlStr);
         return val;
     }
 
@@ -58,17 +57,16 @@ async function getKVCachedL1L2(request, env, ctx, key) {
         headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'max-age=31536000' }
     });
     ctx.waitUntil(edgeCache.put(dummyReq, cacheRes));
-    knownCacheKeys.add(dummyUrlStr);
 
     return val;
 }
 
 /**
- * 【防击穿引擎】L1 (内存) + L2 (Cache API) 双重缓存处理核心
+ * 【防击穿引擎】L1 (内存) + L2 (Cache API) 双重缓存处理核心 (处理订阅与页面响应)
  */
 async function getResponseWithL1L2(request, ctx, fetcher) {
     const urlObj = new URL(request.url);
-    // [修复1] 缓存键投毒防御：彻底抛弃 query 参数，仅使用纯净的 origin + pathname
+    // 缓存键投毒防御：彻底抛弃 query 参数，仅使用纯净的 origin + pathname
     const cleanUrlStr = urlObj.origin + urlObj.pathname;
     const cacheReq = new Request(cleanUrlStr, { method: 'GET' });
 
@@ -85,13 +83,13 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
     const edgeCache = caches.default;
     const l2Response = await edgeCache.match(cacheReq);
     if (l2Response) {
-        // [修复3] L2 回读 OOM 防御：检查体积后再吸入内存
+        // L2 回读 OOM 防御：检查体积后再吸入内存
         const contentLength = l2Response.headers.get('content-length');
         if (!contentLength || parseInt(contentLength, 10) <= MAX_BODY_SIZE) {
             try {
                 const cloned = l2Response.clone();
                 const bodyBuf = await cloned.arrayBuffer();
-                checkMemorySize(); // [修复2] 触发容量检查
+                checkMemorySize(); // 触发容量检查
                 responseMemoryCache.set(cleanUrlStr, {
                     body: bodyBuf,
                     status: l2Response.status,
@@ -117,7 +115,7 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
             try {
                 const bodyBuf = await clonedForL1.arrayBuffer();
                 if (bodyBuf.byteLength <= MAX_BODY_SIZE) { 
-                    checkMemorySize(); // [修复2] 触发容量检查
+                    checkMemorySize(); // 触发容量检查
                     responseMemoryCache.set(cleanUrlStr, {
                         body: bodyBuf,
                         status: clonedForL1.status,
@@ -149,6 +147,20 @@ function clearAllCaches(ctx) {
     lastRouteRulesStr = null;
     
     const edgeCache = caches.default;
+    
+    // [修复] L2 缓存清理失效漏洞：硬编码所有配置 Key 进行强制定向清理，不依赖可能丢失的 Set
+    const knownKVKeys = [
+        "ADMIN_PASSWORD", "ROUTE_RULES", "PROXY_HOSTNAME", 
+        "SUB_LIST_URLS", "SUB_BLACKLIST", "SUB_EXPIRY_DAYS", "ROOT_REDIRECT_URL"
+    ];
+    for (const key of knownKVKeys) {
+        const dummyUrlStr = `http://internal-config.local/__internal_kv_cache/${key}`;
+        try {
+            ctx.waitUntil(edgeCache.delete(new Request(dummyUrlStr, { method: 'GET' })));
+        } catch (e) {}
+    }
+
+    // 清理动态响应（如生成的订阅内容和后台页面）
     for (const key of knownCacheKeys) {
         try {
             ctx.waitUntil(edgeCache.delete(new Request(key, { method: 'GET' })));
