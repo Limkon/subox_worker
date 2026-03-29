@@ -11,14 +11,15 @@ export async function fetchWithRetry(url, retries = 3, timeout = 10000) {
     };
     
     for (let i = 0; i < retries; i++) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        
         try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), timeout);
             const response = await fetch(url, { 
                 signal: controller.signal,
                 headers: headers 
             });
-            clearTimeout(timeoutId);
+            
             if (!response.ok) {
                 throw new Error(`HTTP error ${response.status}`);
             }
@@ -29,6 +30,9 @@ export async function fetchWithRetry(url, retries = 3, timeout = 10000) {
                 throw error;
             }
             await new Promise(resolve => setTimeout(resolve, 1000)); // 等待 1 秒后重试
+        } finally {
+            // 确保无论请求成功、失败还是超时，定时器都会被清理，防止内存泄漏
+            clearTimeout(timeoutId);
         }
     }
 }
@@ -95,7 +99,15 @@ export function isBlacklisted(nodeString, blacklistRegexes) {
     // 3. [vmess 专项] 处理 JSON 内部字段
     if (testString.startsWith('vmess://')) {
         try {
-            const base64Blob = testString.substring(8);
+            let base64Blob = testString.substring(8);
+            
+            // 修复 Base64URL 兼容性问题：替换特殊字符并补齐 '='
+            base64Blob = base64Blob.replace(/-/g, '+').replace(/_/g, '/');
+            const padding = base64Blob.length % 4;
+            if (padding !== 0) {
+                base64Blob += '='.repeat(4 - padding);
+            }
+            
             const jsonString = atob(base64Blob);
             const vmessConfig = JSON.parse(jsonString);
             
