@@ -47,7 +47,14 @@ export function detectAndProcess(textData, uniqueStrings) {
         
         // 尝试 Base64 解码
         try {
-            const decodedData = atob(processedText);
+            // 修复 Base64URL 兼容性问题：替换特殊字符并补齐 '='
+            let base64String = processedText.replace(/-/g, '+').replace(/_/g, '/');
+            const padding = base64String.length % 4;
+            if (padding !== 0) {
+                base64String += '='.repeat(4 - padding);
+            }
+            
+            const decodedData = atob(base64String);
             // 简单启发式判断：如果解码后包含协议头或关键字段，则使用解码后的内容
             if (decodedData.includes("://") || decodedData.includes("\n") || decodedData.includes("proxies:")) {
                  processedText = decodedData;
