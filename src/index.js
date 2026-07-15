@@ -12,7 +12,6 @@ const kvMemoryCache = new Map();
 const responseMemoryCache = new Map();
 const knownCacheKeys = new Set();
 
-// --- 路由规则解析缓存 (CPU 优化核心) ---
 let parsedRulesCache = null;
 let lastRouteRulesStr = null;
 
@@ -240,7 +239,6 @@ export default {
                 let { target } = matchedRule;
                 let keepPath = false; 
                 
-                // [精准修复] 雷达侦测：是否为 Xray/V2ray 节点流量 (支持 WS、HTTPUpgrade、gRPC)
                 const upgradeHeader = request.headers.get('Upgrade');
                 const contentType = request.headers.get('Content-Type');
                 const isNodeTraffic = !!upgradeHeader || (contentType && contentType.toLowerCase().includes('grpc'));
@@ -252,31 +250,27 @@ export default {
                 }
                 
                 url.host = target;
-                // 注意：已彻底移除 url.protocol = 'https:' 的错误干扰，保留原生协议
                 
                 if (!matchedRule.fromReferer && !keepPath) {
                     url.pathname = url.pathname.substring(key.length + 1);
                     if (!url.pathname.startsWith('/')) url.pathname = '/' + url.pathname;
                 }
                 
-                const proxyRequest = new Request(url, request);
-                
-                // [终极核心机制]：双轨制 Header 智能覆写
+                // [Pages 终极核心修复]：彻底解决 Pages 阻断 WebSocket 问题
                 if (isNodeTraffic) {
-                    // 节点流量：原封不动透传客户端的 Host，满足 Xray 底层 SNI 校验
-                    const originalHost = request.headers.get('Host');
-                    if (originalHost) proxyRequest.headers.set('Host', originalHost);
-                } else {
-                    // 正常网页：强制伪装 Host 和 Origin，防止目标服务器 Nginx 报 404/403
-                    proxyRequest.headers.set('Host', url.hostname); 
-                    proxyRequest.headers.set('Origin', `${url.protocol}//${url.hostname}`);
-                }
+                    // 节点流量：不能使用 new Request 否则会剥离 WebSocket 握手。
+                    // 必须直接透传原始 request，仅更换目标 URL，实现完美的 0-RTT 透传！
+                    return fetch(url.toString(), request);
+                } 
                 
+                // 正常网页：安全的克隆请求，篡改 Host 伪装，防止目标 Nginx 返回 404
+                const proxyRequest = new Request(url, request);
+                proxyRequest.headers.set('Host', url.hostname); 
+                proxyRequest.headers.set('Origin', `${url.protocol}//${url.hostname}`);
                 proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
                 
                 const response = await fetch(proxyRequest, { redirect: 'manual' });
                 
-                // 拦截 301/302 重定向，重写 Location 防跳转暴雷
                 if ([301, 302, 303, 307, 308].includes(response.status)) {
                     const location = response.headers.get('Location');
                     if (location) {
@@ -301,21 +295,18 @@ export default {
         if (proxyHost) {
             url.host = proxyHost;
             
-            // [精准修复] 兜底也继承雷达侦测和双轨制
             const upgradeHeader = request.headers.get('Upgrade');
             const contentType = request.headers.get('Content-Type');
             const isNodeTraffic = !!upgradeHeader || (contentType && contentType.toLowerCase().includes('grpc'));
             
-            const proxyRequest = new Request(url, request);
-            
+            // [Pages 终极兜底修复]：同上
             if (isNodeTraffic) {
-                const originalHost = request.headers.get('Host');
-                if (originalHost) proxyRequest.headers.set('Host', originalHost);
-            } else {
-                proxyRequest.headers.set('Host', url.hostname);
-                proxyRequest.headers.set('Origin', `${url.protocol}//${url.hostname}`);
+                return fetch(url.toString(), request);
             }
             
+            const proxyRequest = new Request(url, request);
+            proxyRequest.headers.set('Host', url.hostname);
+            proxyRequest.headers.set('Origin', `${url.protocol}//${url.hostname}`);
             proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
             
             const response = await fetch(proxyRequest, { redirect: 'manual' });
