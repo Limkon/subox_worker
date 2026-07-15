@@ -292,6 +292,7 @@ export default {
                 }
                 
                 url.host = target;
+                url.protocol = 'https:'; // [精准修复三] 强制后端走 TLS 加密通道，防止端口/协议不匹配断流
                 if (!matchedRule.fromReferer && !keepPath) {
                     url.pathname = url.pathname.substring(key.length + 1);
                     if (!url.pathname.startsWith('/')) url.pathname = '/' + url.pathname;
@@ -299,8 +300,8 @@ export default {
                 
                 // 【修复核心 1：利用原生 request 保持 Zero-Copy 流式传输】
                 const proxyRequest = new Request(url, request);
-                proxyRequest.headers.set('Host', url.hostname); 
-                proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+                // proxyRequest.headers.set('Host', url.hostname); // [精准修复四] 严禁篡改 Host，放行节点原生流量校验
+                proxyRequest.headers.set('X-Forwarded-Proto', 'https'); // 配合协议强制指定
                 
                 const response = await fetch(proxyRequest, { redirect: 'manual' });
                 
@@ -328,10 +329,12 @@ export default {
         const proxyHost = await getKVCachedL1L2(request, env, ctx, "PROXY_HOSTNAME");
         if (proxyHost) {
             url.host = proxyHost;
+            url.protocol = 'https:'; // [精准修复三] 兜底同样强制后端走 TLS 加密通道
+            
             // 【修复核心 2：兜底逻辑同理，防止大文件/WebSocket/代理协议中断和掉速】
             const proxyRequest = new Request(url, request);
-            proxyRequest.headers.set('Host', url.hostname);
-            proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+            // proxyRequest.headers.set('Host', url.hostname); // [精准修复四] 严禁篡改 Host
+            proxyRequest.headers.set('X-Forwarded-Proto', 'https');
             
             const response = await fetch(proxyRequest, { redirect: 'manual' });
             
