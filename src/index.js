@@ -286,7 +286,8 @@ export default {
                     keepPath = true; target = target.substring(1);
                 } else if (target.startsWith('^')) {
                     const upgradeHeader = request.headers.get('Upgrade');
-                    const isWS = upgradeHeader && upgradeHeader.toLowerCase() === 'websocket';
+                    // [精准修复一] 使用 includes 替代全等，增强 WebSocket 升级头兼容性
+                    const isWS = upgradeHeader && upgradeHeader.toLowerCase().includes('websocket');
                     keepPath = isWS; target = target.substring(1);
                 }
                 
@@ -301,7 +302,25 @@ export default {
                 proxyRequest.headers.set('Host', url.hostname); 
                 proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
                 
-                return fetch(proxyRequest, { redirect: 'manual' });
+                const response = await fetch(proxyRequest, { redirect: 'manual' });
+                
+                // [精准修复二] 拦截 301/302 重定向，重写 Location 防跳转暴雷 (路由分流代理)
+                if ([301, 302, 303, 307, 308].includes(response.status)) {
+                    const location = response.headers.get('Location');
+                    if (location) {
+                        try {
+                            const locUrl = new URL(location);
+                            if (locUrl.hostname === url.hostname) {
+                                const workerHost = new URL(request.url).hostname;
+                                locUrl.hostname = workerHost;
+                                const modifiedResponse = new Response(response.body, response);
+                                modifiedResponse.headers.set('Location', locUrl.toString());
+                                return modifiedResponse;
+                            }
+                        } catch (e) {}
+                    }
+                }
+                return response;
             }
         }
 
@@ -314,7 +333,25 @@ export default {
             proxyRequest.headers.set('Host', url.hostname);
             proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
             
-            return fetch(proxyRequest, { redirect: 'manual' });
+            const response = await fetch(proxyRequest, { redirect: 'manual' });
+            
+            // [精准修复二] 拦截 301/302 重定向，重写 Location 防跳转暴雷 (兜底反代)
+            if ([301, 302, 303, 307, 308].includes(response.status)) {
+                const location = response.headers.get('Location');
+                if (location) {
+                    try {
+                        const locUrl = new URL(location);
+                        if (locUrl.hostname === url.hostname) {
+                            const workerHost = new URL(request.url).hostname;
+                            locUrl.hostname = workerHost;
+                            const modifiedResponse = new Response(response.body, response);
+                            modifiedResponse.headers.set('Location', locUrl.toString());
+                            return modifiedResponse;
+                        }
+                    } catch (e) {}
+                }
+            }
+            return response;
         }
 
         // 优先级 C: 根目录跳转
