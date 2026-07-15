@@ -199,7 +199,7 @@ export default {
             }
         }
 
-        // --- 路由 3：反向代理与跳转逻辑 (代理流量严格透传) ---
+        // --- 路由 3：反向代理与跳转逻辑 ---
         const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
             if (routeRulesStr !== lastRouteRulesStr || !parsedRulesCache) {
@@ -239,9 +239,11 @@ export default {
                 let { target } = matchedRule;
                 let keepPath = false; 
                 
+                // [扩充雷达] 增加对流式协议特征的捕获 (涵盖 xhttp, grpc, stream 等)
                 const upgradeHeader = request.headers.get('Upgrade');
-                const contentType = request.headers.get('Content-Type');
-                const isNodeTraffic = !!upgradeHeader || (contentType && contentType.toLowerCase().includes('grpc'));
+                const contentType = request.headers.get('Content-Type') || '';
+                const ctLower = contentType.toLowerCase();
+                const isNodeTraffic = !!upgradeHeader || ctLower.includes('grpc') || ctLower.includes('xhttp') || ctLower.includes('stream');
                 
                 if (target.startsWith('*')) {
                     keepPath = true; target = target.substring(1);
@@ -256,18 +258,24 @@ export default {
                     if (!url.pathname.startsWith('/')) url.pathname = '/' + url.pathname;
                 }
                 
-                // 【终极重构核心】：化繁为简，彻底清除违规的 Host 篡改
-                if (isNodeTraffic) {
-                    // 节点流量：最干净的原生透传！不改任何头，规避 Pages V8 引擎的安全阻断
-                    return fetch(new Request(url, request));
-                } 
+                // 【绝杀核心】：统一的 Fetch 参数构建器，利用 ES6 优雅解构，严守 Cloudflare V8 Fetch 规范
+                const fetchInit = {
+                    method: request.method,
+                    headers: request.headers, // 默认透传原生 Header (满足 gRPC/xHTTP 等的严格握手校验)
+                    redirect: 'manual',
+                    // 优雅绑定：只要 request 中存在流式 body，就严格遵循 Fetch 规范打包注入 duplex: 'half'
+                    ...(request.body ? { body: request.body, duplex: 'half' } : {})
+                };
+
+                if (!isNodeTraffic) {
+                    // 网页流量：为了防止目标服务器报 404，安全地伪造 Origin
+                    const webHeaders = new Headers(request.headers);
+                    webHeaders.set('Origin', `${url.protocol}//${url.hostname}`);
+                    webHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+                    fetchInit.headers = webHeaders;
+                }
                 
-                // 网页流量：规避 404
-                const proxyRequest = new Request(url, request);
-                proxyRequest.headers.set('Origin', `${url.protocol}//${url.hostname}`);
-                proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-                
-                const response = await fetch(proxyRequest, { redirect: 'manual' });
+                const response = await fetch(url.toString(), fetchInit);
                 
                 if ([301, 302, 303, 307, 308].includes(response.status)) {
                     const location = response.headers.get('Location');
@@ -288,25 +296,32 @@ export default {
             }
         }
 
-        // 优先级 B: 全局兜底反代
+        // 优先级 B: 全局兜底反代 (逻辑同步)
         const proxyHost = await getKVCachedL1L2(request, env, ctx, "PROXY_HOSTNAME");
         if (proxyHost) {
             url.host = proxyHost;
             
             const upgradeHeader = request.headers.get('Upgrade');
-            const contentType = request.headers.get('Content-Type');
-            const isNodeTraffic = !!upgradeHeader || (contentType && contentType.toLowerCase().includes('grpc'));
+            const contentType = request.headers.get('Content-Type') || '';
+            const ctLower = contentType.toLowerCase();
+            const isNodeTraffic = !!upgradeHeader || ctLower.includes('grpc') || ctLower.includes('xhttp') || ctLower.includes('stream');
             
-            if (isNodeTraffic) {
-                // 节点流量终极透传
-                return fetch(new Request(url, request));
+            // 【绝杀核心】：全局兜底使用同款优雅解构处理流式报文
+            const fetchInit = {
+                method: request.method,
+                headers: request.headers,
+                redirect: 'manual',
+                ...(request.body ? { body: request.body, duplex: 'half' } : {})
+            };
+
+            if (!isNodeTraffic) {
+                const webHeaders = new Headers(request.headers);
+                webHeaders.set('Origin', `${url.protocol}//${url.hostname}`);
+                webHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+                fetchInit.headers = webHeaders;
             }
             
-            const proxyRequest = new Request(url, request);
-            proxyRequest.headers.set('Origin', `${url.protocol}//${url.hostname}`);
-            proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-            
-            const response = await fetch(proxyRequest, { redirect: 'manual' });
+            const response = await fetch(url.toString(), fetchInit);
             
             if ([301, 302, 303, 307, 308].includes(response.status)) {
                 const location = response.headers.get('Location');
