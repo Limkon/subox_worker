@@ -256,31 +256,18 @@ export default {
                     if (!url.pathname.startsWith('/')) url.pathname = '/' + url.pathname;
                 }
                 
-                // 【终极重构核心】：完全抛弃 new Request()，全手动挡解构组装请求
-                const proxyHeaders = new Headers(request.headers);
+                // 【终极重构核心】：化繁为简，彻底清除违规的 Host 篡改
                 if (isNodeTraffic) {
-                    // 强制锁定原本的 Pages/Worker 域名，满足节点防探测校验
-                    const originalHost = request.headers.get('Host');
-                    if (originalHost) proxyHeaders.set('Host', originalHost);
-                } else {
-                    // 网页浏览模式：伪装为目标域名，防 404
-                    proxyHeaders.set('Host', url.hostname); 
-                    proxyHeaders.set('Origin', `${url.protocol}//${url.hostname}`);
-                }
-                proxyHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-
-                const fetchInit = {
-                    method: request.method,
-                    headers: proxyHeaders,
-                    redirect: 'manual'
-                };
+                    // 节点流量：最干净的原生透传！不改任何头，规避 Pages V8 引擎的安全阻断
+                    return fetch(new Request(url, request));
+                } 
                 
-                // 严密规避 Pages 环境下 GET/HEAD 请求带 body 导致的 500 断流
-                if (request.method !== 'GET' && request.method !== 'HEAD') {
-                    fetchInit.body = request.body;
-                }
+                // 网页流量：规避 404
+                const proxyRequest = new Request(url, request);
+                proxyRequest.headers.set('Origin', `${url.protocol}//${url.hostname}`);
+                proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
                 
-                const response = await fetch(url.toString(), fetchInit);
+                const response = await fetch(proxyRequest, { redirect: 'manual' });
                 
                 if ([301, 302, 303, 307, 308].includes(response.status)) {
                     const location = response.headers.get('Location');
@@ -310,28 +297,16 @@ export default {
             const contentType = request.headers.get('Content-Type');
             const isNodeTraffic = !!upgradeHeader || (contentType && contentType.toLowerCase().includes('grpc'));
             
-            // 兜底逻辑同步【终极重构核心】
-            const proxyHeaders = new Headers(request.headers);
             if (isNodeTraffic) {
-                const originalHost = request.headers.get('Host');
-                if (originalHost) proxyHeaders.set('Host', originalHost);
-            } else {
-                proxyHeaders.set('Host', url.hostname);
-                proxyHeaders.set('Origin', `${url.protocol}//${url.hostname}`);
-            }
-            proxyHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-            
-            const fetchInit = {
-                method: request.method,
-                headers: proxyHeaders,
-                redirect: 'manual'
-            };
-            
-            if (request.method !== 'GET' && request.method !== 'HEAD') {
-                fetchInit.body = request.body;
+                // 节点流量终极透传
+                return fetch(new Request(url, request));
             }
             
-            const response = await fetch(url.toString(), fetchInit);
+            const proxyRequest = new Request(url, request);
+            proxyRequest.headers.set('Origin', `${url.protocol}//${url.hostname}`);
+            proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+            
+            const response = await fetch(proxyRequest, { redirect: 'manual' });
             
             if ([301, 302, 303, 307, 308].includes(response.status)) {
                 const location = response.headers.get('Location');
