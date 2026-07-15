@@ -256,20 +256,31 @@ export default {
                     if (!url.pathname.startsWith('/')) url.pathname = '/' + url.pathname;
                 }
                 
-                // [Pages 终极核心修复]：彻底解决 Pages 阻断 WebSocket 问题
+                // 【终极重构核心】：完全抛弃 new Request()，全手动挡解构组装请求
+                const proxyHeaders = new Headers(request.headers);
                 if (isNodeTraffic) {
-                    // 节点流量：不能使用 new Request 否则会剥离 WebSocket 握手。
-                    // 必须直接透传原始 request，仅更换目标 URL，实现完美的 0-RTT 透传！
-                    return fetch(url.toString(), request);
-                } 
+                    // 强制锁定原本的 Pages/Worker 域名，满足节点防探测校验
+                    const originalHost = request.headers.get('Host');
+                    if (originalHost) proxyHeaders.set('Host', originalHost);
+                } else {
+                    // 网页浏览模式：伪装为目标域名，防 404
+                    proxyHeaders.set('Host', url.hostname); 
+                    proxyHeaders.set('Origin', `${url.protocol}//${url.hostname}`);
+                }
+                proxyHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+
+                const fetchInit = {
+                    method: request.method,
+                    headers: proxyHeaders,
+                    redirect: 'manual'
+                };
                 
-                // 正常网页：安全的克隆请求，篡改 Host 伪装，防止目标 Nginx 返回 404
-                const proxyRequest = new Request(url, request);
-                proxyRequest.headers.set('Host', url.hostname); 
-                proxyRequest.headers.set('Origin', `${url.protocol}//${url.hostname}`);
-                proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+                // 严密规避 Pages 环境下 GET/HEAD 请求带 body 导致的 500 断流
+                if (request.method !== 'GET' && request.method !== 'HEAD') {
+                    fetchInit.body = request.body;
+                }
                 
-                const response = await fetch(proxyRequest, { redirect: 'manual' });
+                const response = await fetch(url.toString(), fetchInit);
                 
                 if ([301, 302, 303, 307, 308].includes(response.status)) {
                     const location = response.headers.get('Location');
@@ -299,17 +310,28 @@ export default {
             const contentType = request.headers.get('Content-Type');
             const isNodeTraffic = !!upgradeHeader || (contentType && contentType.toLowerCase().includes('grpc'));
             
-            // [Pages 终极兜底修复]：同上
+            // 兜底逻辑同步【终极重构核心】
+            const proxyHeaders = new Headers(request.headers);
             if (isNodeTraffic) {
-                return fetch(url.toString(), request);
+                const originalHost = request.headers.get('Host');
+                if (originalHost) proxyHeaders.set('Host', originalHost);
+            } else {
+                proxyHeaders.set('Host', url.hostname);
+                proxyHeaders.set('Origin', `${url.protocol}//${url.hostname}`);
+            }
+            proxyHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+            
+            const fetchInit = {
+                method: request.method,
+                headers: proxyHeaders,
+                redirect: 'manual'
+            };
+            
+            if (request.method !== 'GET' && request.method !== 'HEAD') {
+                fetchInit.body = request.body;
             }
             
-            const proxyRequest = new Request(url, request);
-            proxyRequest.headers.set('Host', url.hostname);
-            proxyRequest.headers.set('Origin', `${url.protocol}//${url.hostname}`);
-            proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-            
-            const response = await fetch(proxyRequest, { redirect: 'manual' });
+            const response = await fetch(url.toString(), fetchInit);
             
             if ([301, 302, 303, 307, 308].includes(response.status)) {
                 const location = response.headers.get('Location');
