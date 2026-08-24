@@ -284,11 +284,13 @@ export default {
                 let keepPath = false; 
                 
                 if (target.startsWith('*')) {
-                    keepPath = true; target = target.substring(1);
+                    keepPath = true; 
+                    target = target.substring(1);
                 } else if (target.startsWith('^')) {
-                    const upgradeHeader = request.headers.get('Upgrade');
-                    const isWS = upgradeHeader && upgradeHeader.toLowerCase() === 'websocket';
-                    keepPath = isWS; target = target.substring(1);
+                    // ^ 前缀表示去除 route key 前缀（例如将 /ws/xx 裁剪为 /xx，或将 /grpc_key/Service/Method 裁剪为 /Service/Method）
+                    // 确保长连接协议（WebSocket、gRPC、xHTTP 等）及普通请求均能正确将子路径传给目标服务端
+                    keepPath = false; 
+                    target = target.substring(1);
                 }
                 
                 // 自动剥离 target 可能包含的 http:// / https:// 及路径后缀，防止 url.host 抛出 Invalid Host 异常
@@ -303,7 +305,13 @@ export default {
                 proxyRequest.headers.set('Host', url.hostname); 
                 proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
                 
-                return fetch(proxyRequest, { redirect: 'manual' });
+                // 针对 gRPC、xHTTP 及流式 Body 请求，开启 duplex 模式防止传输中断
+                const fetchOpts = { redirect: 'manual' };
+                if (request.body) {
+                    fetchOpts.duplex = 'half';
+                }
+                
+                return fetch(proxyRequest, fetchOpts);
             }
         }
 
@@ -316,7 +324,12 @@ export default {
             proxyRequest.headers.set('Host', url.hostname);
             proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
             
-            return fetch(proxyRequest, { redirect: 'manual' });
+            const fetchOpts = { redirect: 'manual' };
+            if (request.body) {
+                fetchOpts.duplex = 'half';
+            }
+            
+            return fetch(proxyRequest, fetchOpts);
         }
 
         // 优先级 C: 根目录跳转
