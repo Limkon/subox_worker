@@ -1,0 +1,46 @@
+name: ObfB-build Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@main
+        with:
+          node-version: 'x'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build worker
+        run: npm run build
+
+      # 调用 Node.js 版本的混淆脚本，并在原目录下完成新旧文件替换
+      - name: Obfuscate worker
+        run: |
+          node obfuscator.js result/_worker.js
+          rm result/_worker.js
+          mv result/_worker_clean.js result/_worker.js
+
+      - name: Zip output
+        run: |
+          cd result
+          zip _worker.zip _worker.js
+
+      - name: Commit and push result
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add result/_worker.zip
+          git commit -m "build: update worker script in result/ [skip ci]" || echo "No changes to commit"
+          git push
