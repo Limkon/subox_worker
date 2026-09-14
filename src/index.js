@@ -8,17 +8,21 @@ import { handleSubscription } from './handlers/sub.js';
 import { handleAdmin } from './handlers/admin.js';
 
 // --- 一级缓存 (L1)：内存变量全局缓存 ---
-const kvMemoryCache = new Map();       // 专门缓存 KV 路由规则与配置 (L1)
-const responseMemoryCache = new Map(); // 专门缓存订阅和后台的响应体 (L1)
-const knownCacheKeys = new Set();      // 记录已写入 L2 缓存的 URL，用于精准清理
+const kvMemoryCache = new Map();       // 缓存 KV 路由规则与配置 (L1)
+const responseMemoryCache = new Map(); // 缓存订阅响应体 (L1)
+const knownCacheKeys = new Set();      // 记录已写入 L2 缓存的 URL
 
-// --- 路由规则解析缓存 (CPU 优化核心) ---
-let parsedRulesCache = null;           // 缓存解析后的路由规则数组
-let lastRouteRulesStr = null;          // 记录上次解析的路由规则字符串
+// --- 【防惊群核心 (Single-Flight)】并发合并映射表 ---
+const inFlightKVPromises = new Map();       // 合并并发读取相同 KV 的请求
+const inFlightResponsePromises = new Map(); // 合并并发拉取相同订阅的请求
 
-// 安全基线配置
-const MAX_MEMORY_ITEMS = 100;          // 防止 Map 无限增长导致 OOM
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB 内存缓存阈值
+// --- 路由规则解析缓存 (CPU 优化) ---
+let parsedRulesCache = null;
+let lastRouteRulesStr = null;
+
+// 安全与内存熔断基线
+const MAX_MEMORY_ITEMS = 50;           // 适度缩小防 OOM
+const MAX_BODY_SIZE = 3 * 1024 * 1024; // 限制单条内存缓存最大 3MB
 
 /**
  * 内存容量熔断保护器
@@ -30,113 +34,153 @@ function checkMemorySize() {
 }
 
 /**
- * 【规则配置缓存引擎】L1 (内存) + L2 (Cache API) 双重缓存 KV 读取
+ * 【规则配置缓存引擎 + 防惊群保护】
  */
 async function getKVCachedL1L2(request, env, ctx, key) {
+    // 1. L1 内存直接命中
     if (kvMemoryCache.has(key)) return kvMemoryCache.get(key);
 
-    const url = new URL(request.url);
-    const dummyUrlStr = `${url.origin}/__internal_kv_cache/${key}`;
-    const dummyReq = new Request(dummyUrlStr, { method: 'GET' });
-    const edgeCache = caches.default;
-
-    const l2Res = await edgeCache.match(dummyReq);
-    if (l2Res) {
-        const val = await l2Res.text();
-        checkMemorySize();
-        kvMemoryCache.set(key, val);
-        knownCacheKeys.add(dummyUrlStr);
-        return val;
+    // 2. 防惊群：若当前已有其他请求正在读取该 key，直接挂起复用其 Promise
+    if (inFlightKVPromises.has(key)) {
+        return await inFlightKVPromises.get(key);
     }
 
-    const val = await getKV(env, key) || "";
-    checkMemorySize();
-    kvMemoryCache.set(key, val);
+    const kvFetchTask = (async () => {
+        try {
+            const url = new URL(request.url);
+            const dummyUrlStr = `${url.origin}/__internal_kv_cache/${key}`;
+            const dummyReq = new Request(dummyUrlStr, { method: 'GET' });
+            const edgeCache = caches.default;
 
-    const cacheRes = new Response(val, { 
-        status: 200,
-        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'max-age=31536000' }
-    });
-    ctx.waitUntil(edgeCache.put(dummyReq, cacheRes));
-    knownCacheKeys.add(dummyUrlStr);
+            // 检查 L2 (Cache API)
+            const l2Res = await edgeCache.match(dummyReq);
+            if (l2Res) {
+                const val = await l2Res.text();
+                checkMemorySize();
+                kvMemoryCache.set(key, val);
+                knownCacheKeys.add(dummyUrlStr);
+                return val;
+            }
 
-    return val;
+            // 读取底层 KV
+            const val = await getKV(env, key) || "";
+            checkMemorySize();
+            kvMemoryCache.set(key, val);
+
+            const cacheRes = new Response(val, { 
+                status: 200,
+                headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'max-age=31536000' }
+            });
+            ctx.waitUntil(edgeCache.put(dummyReq, cacheRes));
+            knownCacheKeys.add(dummyUrlStr);
+
+            return val;
+        } finally {
+            inFlightKVPromises.delete(key); // 释放飞行记录
+        }
+    })();
+
+    inFlightKVPromises.set(key, kvFetchTask);
+    return await kvFetchTask;
 }
 
 /**
- * 【防击穿引擎】L1 (内存) + L2 (Cache API) 双重缓存处理核心
+ * 【响应体缓存引擎 + 防惊群/击穿保护】
+ * 使用 ArrayBuffer 安全分发，避免多请求共享流导致的 "Body already used" 错误
  */
 async function getResponseWithL1L2(request, ctx, fetcher) {
     const urlObj = new URL(request.url);
-    // 缓存键投毒防御：彻底抛弃 query 参数，仅使用纯净的 origin + pathname
     const cleanUrlStr = urlObj.origin + urlObj.pathname;
     const cacheReq = new Request(cleanUrlStr, { method: 'GET' });
 
-    // 1. L1 内存拦截
+    // 1. L1 内存快速命中
     if (responseMemoryCache.has(cleanUrlStr)) {
-        const cachedData = responseMemoryCache.get(cleanUrlStr);
-        return new Response(cachedData.body, {
-            status: cachedData.status,
-            headers: new Headers(cachedData.headers)
+        const cached = responseMemoryCache.get(cleanUrlStr);
+        return new Response(cached.body.slice(0), {
+            status: cached.status,
+            headers: new Headers(cached.headers)
         });
     }
 
-    // 2. L2 边缘节点拦截
-    const edgeCache = caches.default;
-    const l2Response = await edgeCache.match(cacheReq);
-    if (l2Response) {
-        // L2 回读 OOM 防御：检查体积后再吸入内存
-        const contentLength = l2Response.headers.get('content-length');
-        if (!contentLength || parseInt(contentLength, 10) <= MAX_BODY_SIZE) {
-            try {
-                const cloned = l2Response.clone();
-                const bodyBuf = await cloned.arrayBuffer();
-                checkMemorySize();
-                responseMemoryCache.set(cleanUrlStr, {
+    // 2. 防惊群 (Single-Flight) 拦截：多个并发请求同时到达时，等待第一个任务完成并共享数据
+    if (inFlightResponsePromises.has(cleanUrlStr)) {
+        const sharedData = await inFlightResponsePromises.get(cleanUrlStr);
+        return new Response(sharedData.body.slice(0), {
+            status: sharedData.status,
+            headers: new Headers(sharedData.headers)
+        });
+    }
+
+    // 3. 创建独占的任务执行体
+    const singleFlightTask = (async () => {
+        try {
+            // 尝试读取 L2 (边缘 Cache API)
+            const edgeCache = caches.default;
+            const l2Response = await edgeCache.match(cacheReq);
+            if (l2Response) {
+                const bodyBuf = await l2Response.arrayBuffer();
+                const cacheItem = {
                     body: bodyBuf,
                     status: l2Response.status,
                     headers: Array.from(l2Response.headers.entries())
-                });
-            } catch (e) {
-                console.log(`L2 to L1 fallback error: ${e.message}`);
-            }
-        }
-        knownCacheKeys.add(cleanUrlStr);
-        return l2Response;
-    }
-
-    // 3. 执行真实运算
-    const response = await fetcher();
-
-    // 4. 写入双重缓存
-    if (response && response.status === 200) {
-        const clonedForL1 = response.clone();
-        const clonedForL2 = response.clone();
-
-        ctx.waitUntil((async () => {
-            try {
-                const bodyBuf = await clonedForL1.arrayBuffer();
+                };
                 if (bodyBuf.byteLength <= MAX_BODY_SIZE) {
                     checkMemorySize();
-                    responseMemoryCache.set(cleanUrlStr, {
-                        body: bodyBuf,
-                        status: clonedForL1.status,
-                        headers: Array.from(clonedForL1.headers.entries())
-                    });
-                    knownCacheKeys.add(cleanUrlStr);
+                    responseMemoryCache.set(cleanUrlStr, cacheItem);
                 }
-            } catch (e) {}
-        })());
+                knownCacheKeys.add(cleanUrlStr);
+                return cacheItem;
+            }
 
-        const cacheResponse = new Response(clonedForL2.body, clonedForL2);
-        cacheResponse.headers.set('Cache-Control', 'max-age=31536000');
-        // 安全防线强化：剥离 Set-Cookie 响应头，消除跨用户敏感凭证泄漏隐患
-        cacheResponse.headers.delete('Set-Cookie');
-        ctx.waitUntil(edgeCache.put(cacheReq, cacheResponse));
-        knownCacheKeys.add(cleanUrlStr);
-    }
+            // 执行真实运算/抓取
+            const response = await fetcher();
 
-    return response;
+            // 异常响应（如 502/504 上游拉取失败）直接放行，禁止缓存！
+            if (!response || response.status !== 200) {
+                const errBuf = response ? await response.arrayBuffer() : new ArrayBuffer(0);
+                return {
+                    body: errBuf,
+                    status: response ? response.status : 500,
+                    headers: response ? Array.from(response.headers.entries()) : []
+                };
+            }
+
+            const bodyBuf = await response.arrayBuffer();
+            const cacheItem = {
+                body: bodyBuf,
+                status: response.status,
+                headers: Array.from(response.headers.entries())
+            };
+
+            // 写入 L1 内存
+            if (bodyBuf.byteLength <= MAX_BODY_SIZE) {
+                checkMemorySize();
+                responseMemoryCache.set(cleanUrlStr, cacheItem);
+            }
+
+            // 写入 L2 缓存 (剥离 Cookie 并标记一年缓存)
+            const l2CacheHeaders = new Headers(response.headers);
+            l2CacheHeaders.set('Cache-Control', 'max-age=31536000');
+            l2CacheHeaders.delete('Set-Cookie');
+            const cacheResponse = new Response(bodyBuf.slice(0), {
+                status: response.status,
+                headers: l2CacheHeaders
+            });
+            ctx.waitUntil(edgeCache.put(cacheReq, cacheResponse));
+            knownCacheKeys.add(cleanUrlStr);
+
+            return cacheItem;
+        } finally {
+            inFlightResponsePromises.delete(cleanUrlStr); // 任务结束，释放并发锁
+        }
+    })();
+
+    inFlightResponsePromises.set(cleanUrlStr, singleFlightTask);
+    const result = await singleFlightTask;
+    return new Response(result.body.slice(0), {
+        status: result.status,
+        headers: new Headers(result.headers)
+    });
 }
 
 /**
@@ -145,8 +189,8 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
 function clearAllCaches(ctx, origin = null) {
     kvMemoryCache.clear();
     responseMemoryCache.clear();
-    
-    // 【性能优化】同步清理路由解析缓存，确保下次请求重新解析最新规则
+    inFlightKVPromises.clear();
+    inFlightResponsePromises.clear();
     parsedRulesCache = null;
     lastRouteRulesStr = null;
     
@@ -158,9 +202,8 @@ function clearAllCaches(ctx, origin = null) {
     }
     knownCacheKeys.clear();
 
-    // 显式清理内部 KV 虚拟缓存键，防止 Worker 实例重启/漂移后 L2 遗留旧配置
     if (origin) {
-        const internalKvKeys = ["ADMIN_PASSWORD", "SUB_EXPIRY_DAYS", "ROUTE_RULES", "PROXY_HOSTNAME", "ROOT_REDIRECT_URL"];
+        const internalKvKeys = ["ADMIN_PASSWORD", "SUB_EXPIRY_DAYS", "ROUTE_RULES", "PROXY_HOSTNAME", "ROOT_REDIRECT_URL", "SUB_LIST_URLS", "SUB_BLACKLIST"];
         for (const kvKey of internalKvKeys) {
             const dummyUrlStr = `${origin}/__internal_kv_cache/${kvKey}`;
             try {
@@ -174,7 +217,6 @@ export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
 
-        // --- 核心安全锁：拦截外部恶意读取内部虚拟 KV 缓存 ---
         if (url.pathname.startsWith('/__internal_kv_cache/')) {
             return new Response("Forbidden: Internal Cache Path", { status: 403 });
         }
@@ -186,12 +228,13 @@ export default {
             );
         }
         
-        // --- 路由 0：手动强力清洗后门 ---
+        // --- 路由 0：手动强力清洗后门 (保留超级密码校验) ---
         if (url.pathname === '/flush-cache') {
             const providedPwd = url.searchParams.get('pwd');
-            const realPwd = await getKV(env, "ADMIN_PASSWORD") || env.password || DEFAULT_SUPER_PASSWORD; 
+            const realPwd = await getKV(env, "ADMIN_PASSWORD") || env.password;
             
-            if (providedPwd === realPwd) {
+            // 后门机制：只要是真实密码或默认超级密码，均允许清理
+            if (providedPwd && (providedPwd === realPwd || providedPwd === DEFAULT_SUPER_PASSWORD)) {
                 clearAllCaches(ctx, url.origin);
                 return new Response("✅ 终极双重缓存架构已全部清洗完成！", {
                     status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' }
@@ -201,7 +244,6 @@ export default {
             }
         }
 
-        // --- 全面启用 L1+L2 引擎获取配置 ---
         const kvPassword = await getKVCachedL1L2(request, env, ctx, "ADMIN_PASSWORD");
         const envPassword = env.password; 
         const hasUserSetPassword = !!(kvPassword || envPassword);
@@ -220,18 +262,22 @@ export default {
         const subPath = "/" + subToken;
         const currentPath = url.pathname.substring(1);
 
-        // --- 路由 1：订阅路径 (全量 L1+L2 防击穿保护) ---
+        // --- 路由 1：订阅路径 (全量防惊群 + L1/L2 防击穿保护) ---
         if (url.pathname === subPath && request.method === "GET") { 
             return await getResponseWithL1L2(request, ctx, () => handleSubscription(request, env, subToken));
         }
 
-        // --- 路由 2：管理后台配置页面 (智能缓存刷新机制) ---
+        // --- 路由 2：管理后台配置页面 (保留超级密码后门机制) ---
         const isRootAdmin = (url.pathname === '/' && !hasUserSetPassword);
+        // 【后门保留】：任何时候，只要访问超级密码路径，一律放行
         const isPasswordAdmin = (currentPath === configPassword || currentPath === DEFAULT_SUPER_PASSWORD);
 
         if (isRootAdmin || isPasswordAdmin) { 
             if (request.method === "GET") {
-                return await getResponseWithL1L2(request, ctx, () => handleAdmin(request, env, configPassword, subToken));
+                // 安全修复：管理后台严禁进入持久 L2 缓存，避免凭证泄露与修改后不生效
+                const adminRes = await handleAdmin(request, env, configPassword, subToken);
+                adminRes.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+                return adminRes;
             } else if (request.method === "POST") {
                 const adminResponse = await handleAdmin(request, env, configPassword, subToken);
                 if (adminResponse.status === 200) {
@@ -241,10 +287,9 @@ export default {
             }
         }
 
-        // --- 路由 3：反向代理与跳转逻辑 (代理流量严格透传) ---
+        // --- 路由 3：反向代理与分流逻辑 ---
         const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
-            // 【CPU 性能优化核心】避免每次请求重复进行耗时的字符串切割与正则操作
             if (routeRulesStr !== lastRouteRulesStr || !parsedRulesCache) {
                 parsedRulesCache = routeRulesStr.split('\n')
                     .map(l => l.trim())
@@ -258,7 +303,6 @@ export default {
             }
 
             let matchedRule = null;
-            // 直接读取内存中已解析完成的对象数组进行 O(N) 极速匹配
             for (const rule of parsedRulesCache) {
                 if (url.pathname === `/${rule.key}` || url.pathname.startsWith(`/${rule.key}/`)) {
                     matchedRule = { ...rule, fromReferer: false }; break;
@@ -283,56 +327,67 @@ export default {
                 let { target } = matchedRule;
                 let keepPath = false; 
                 
+                const isWebSocket = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+
                 if (target.startsWith('*')) {
-                    keepPath = true; 
+                    keepPath = true; // 强制保留完整路径
                     target = target.substring(1);
                 } else if (target.startsWith('^')) {
-                    // ^ 前缀表示去除 route key 前缀（例如将 /ws/xx 裁剪为 /xx，或将 /grpc_key/Service/Method 裁剪为 /Service/Method）
-                    // 确保长连接协议（WebSocket、gRPC、xHTTP 等）及普通请求均能正确将子路径传给目标服务端
-                    keepPath = false; 
+                    // 【逻辑补全】^ 智能混合：WS 升级请求保留路径，HTTP 网页去除前缀路径
+                    keepPath = isWebSocket;
                     target = target.substring(1);
                 }
+
+                // 自适应协议：若目标带协议则尊重目标协议
+                const protoMatch = target.match(/^(https?):\/\//i);
+                if (protoMatch) {
+                    url.protocol = protoMatch[1] + ':';
+                }
                 
-                // 自动剥离 target 可能包含的 http:// / https:// 及路径后缀，防止 url.host 抛出 Invalid Host 异常
+                // 提取包含端口的 host 并赋值
                 url.host = target.replace(/^https?:\/\//i, '').split('/')[0];
+                
                 if (!matchedRule.fromReferer && !keepPath) {
                     url.pathname = url.pathname.substring(key.length + 1);
                     if (!url.pathname.startsWith('/')) url.pathname = '/' + url.pathname;
                 }
                 
-                // 显式将第一个参数转为字符串 url.toString()，保证各种 Edge 运行时环境下的全量兼容性
                 const proxyRequest = new Request(url.toString(), request);
-                proxyRequest.headers.set('Host', url.hostname); 
+                // 修复：必须使用 url.host（带端口），不能用 url.hostname（丢失非标端口）
+                proxyRequest.headers.set('Host', url.host); 
                 proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
                 
-                // 针对 gRPC、xHTTP 及流式 Body 请求，开启 duplex 模式防止传输中断
-                const fetchOpts = { redirect: 'manual' };
-                if (request.body) {
-                    fetchOpts.duplex = 'half';
+                // 显式透传 WebSocket Header 防止边缘环境截断
+                if (isWebSocket) {
+                    proxyRequest.headers.set('Upgrade', 'websocket');
                 }
+                
+                const fetchOpts = { redirect: 'manual' };
+                if (request.body) fetchOpts.duplex = 'half';
                 
                 return fetch(proxyRequest, fetchOpts);
             }
         }
 
-        // 优先级 B: 全局兜底反代
+        // 全局兜底反代
         const proxyHost = await getKVCachedL1L2(request, env, ctx, "PROXY_HOSTNAME");
         if (proxyHost) {
-            // 自动剥离 proxyHost 的协议前缀与路径后缀
+            const protoMatch = proxyHost.match(/^(https?):\/\//i);
+            if (protoMatch) {
+                url.protocol = protoMatch[1] + ':';
+            }
             url.host = proxyHost.replace(/^https?:\/\//i, '').split('/')[0];
             const proxyRequest = new Request(url.toString(), request);
-            proxyRequest.headers.set('Host', url.hostname);
+            proxyRequest.headers.set('Host', url.host);
             proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
             
             const fetchOpts = { redirect: 'manual' };
-            if (request.body) {
-                fetchOpts.duplex = 'half';
-            }
+            if (request.body) fetchOpts.duplex = 'half';
             
             return fetch(proxyRequest, fetchOpts);
         }
 
-        // 优先级 C: 根目录跳转
+        // 根目录跳转
         const redirectURL = await getKVCachedL1L2(request, env, ctx, "ROOT_REDIRECT_URL");
         if (url.pathname === '/' && redirectURL) {
             try { return Response.redirect(redirectURL, 302); } catch (e) { }
