@@ -11,74 +11,51 @@ import {
     processClash, 
     processSubscription 
 } from '../protocols/index.js';
-
-// [修复] 显式引入本地 js-yaml 库，确保打包时包含该库并在运行时可用
+import { safeBase64Decode } from './helpers.js';
 import jsyaml from './js-yaml.min.js';
 
-/**
- * 自动检测并处理数据类型
- * @param {string} textData 原始文本数据
- * @param {Set} uniqueStrings 用于存储去重后的节点字符串
- */
 export function detectAndProcess(textData, uniqueStrings) {
     try {
-        // 尝试解析为 JSON
         const jsonData = JSON.parse(textData);
-        
         if (jsonData.outbounds && Array.isArray(jsonData.outbounds)) {
-            processXray(jsonData, uniqueStrings); // Xray (sing-box outbound)
+            processXray(jsonData, uniqueStrings);
         } else if (jsonData.server && jsonData.auth && jsonData.tls) {
-            processHysteria2(jsonData, uniqueStrings); // Hysteria2 (config.json)
+            processHysteria2(jsonData, uniqueStrings);
         } else if (jsonData.server_port && jsonData.up_mbps) {
-            processSingbox(jsonData, uniqueStrings); // Singbox (Hysteria 1)
+            processSingbox(jsonData, uniqueStrings);
         } else if (jsonData.up_mbps && jsonData.auth_str) {
-            processHysteria(jsonData, uniqueStrings); // Hysteria (config.json)
+            processHysteria(jsonData, uniqueStrings);
         } else if (jsonData.proxy) {
-            processNaive(jsonData, uniqueStrings); // Naive (config.json)
+            processNaive(jsonData, uniqueStrings);
         } else if (jsonData.proxies && Array.isArray(jsonData.proxies)) {
-            processClash(jsonData, uniqueStrings); // Clash JSON
-        } else {
-            console.log("Unknown JSON format. Skipping.");
+            processClash(jsonData, uniqueStrings);
         }
     } catch (e) {
-        // 非 JSON 格式，尝试处理 Base64 或 YAML
         let processedText = textData.trim();
         let isYaml = false;
-        
-        // 尝试 Base64 解码
+
+        // 尝试安全 Base64 解码
         try {
-            // 修复 Base64URL 兼容性问题：替换特殊字符并补齐 '='
-            let base64String = processedText.replace(/-/g, '+').replace(/_/g, '/');
-            const padding = base64String.length % 4;
-            if (padding !== 0) {
-                base64String += '='.repeat(4 - padding);
+            const decoded = safeBase64Decode(processedText);
+            if (decoded.includes("://") || decoded.includes("\n") || decoded.includes("proxies:")) {
+                processedText = decoded;
             }
-            
-            const decodedData = atob(base64String);
-            // 简单启发式判断：如果解码后包含协议头或关键字段，则使用解码后的内容
-            if (decodedData.includes("://") || decodedData.includes("\n") || decodedData.includes("proxies:")) {
-                 processedText = decodedData;
-            }
-        } catch (base64Error) {
-            // 解码失败说明是纯文本或 YAML，继续处理
-        }
-        
-        // [修复] 直接使用引入的 jsyaml 变量，移除 typeof check
-        // 检测是否包含 YAML 特征关键字
+        } catch (err) {}
+
+        // 检测 YAML 格式
         if (processedText.includes('proxies:') || processedText.includes('proxy-groups:')) {
             try {
-                // 使用 jsyaml.load 解析
-                const yamlData = jsyaml.load(processedText);
-                if (yamlData && yamlData.proxies) {
-                    processClash(yamlData, uniqueStrings);
-                    isYaml = true;
+                const yamlParser = jsyaml || globalThis.jsyaml;
+                if (yamlParser && typeof yamlParser.load === 'function') {
+                    const yamlData = yamlParser.load(processedText);
+                    if (yamlData && yamlData.proxies) {
+                        processClash(yamlData, uniqueStrings);
+                        isYaml = true;
+                    }
                 }
-            } catch (yamlError) {
-                console.log("YAML parsing failed, falling back to subscription.");
-            }
+            } catch (yamlErr) {}
         }
-        
-        // 如果不是 YAML，则作为标准订阅（Base64 或 纯文本链接列表）处理
+
         if (!isYaml) {
             processSubscription(processedText, uniqueStrings);
         }
