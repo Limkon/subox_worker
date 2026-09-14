@@ -3,123 +3,100 @@
 // =================================================================
 
 /**
- * 带有重试机制的 fetch 函数
+ * UTF-8 安全的 Base64 编码
  */
-export async function fetchWithRetry(url, retries = 3, timeout = 10000) { 
+export function safeBase64Encode(str) {
+    const bytes = new TextEncoder().encode(str);
+    const binString = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('');
+    return btoa(binString);
+}
+
+/**
+ * UTF-8 安全的 Base64 解码 (防止中文字符乱码)
+ */
+export function safeBase64Decode(base64Str) {
+    let clean = base64Str.replace(/-/g, '+').replace(/_/g, '/');
+    const padding = clean.length % 4;
+    if (padding !== 0) clean += '='.repeat(4 - padding);
+    const binString = atob(clean);
+    const bytes = Uint8Array.from(binString, (m) => m.charCodeAt(0));
+    return new TextDecoder('utf-8').decode(bytes);
+}
+
+/**
+ * 带有超时和单次重试的快速 fetch
+ */
+export async function fetchWithRetry(url, retries = 1, timeout = 6000) { 
     const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     };
     
-    for (let i = 0; i < retries; i++) {
+    for (let i = 0; i <= retries; i++) {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeout);
-        
         try {
-            const response = await fetch(url, { 
-                signal: controller.signal,
-                headers: headers 
-            });
-            
-            if (!response.ok) {
-                throw new Error(`HTTP error ${response.status}`);
-            }
+            const response = await fetch(url, { signal: controller.signal, headers });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
             return response;
         } catch (error) {
-            if (i === retries - 1) {
-                console.log(`Failed to fetch ${url} after ${retries} attempts: ${error.message}`);
-                throw error;
-            }
-            await new Promise(resolve => setTimeout(resolve, 1000)); // 等待 1 秒后重试
+            if (i === retries) throw error;
+            await new Promise(r => setTimeout(r, 500));
         } finally {
-            // 确保无论请求成功、失败还是超时，定时器都会被清理，防止内存泄漏
             clearTimeout(timeoutId);
         }
     }
 }
 
-/**
- * SHA-1 哈希辅助函数
- */
 export async function sha1(str) {
     const buffer = new TextEncoder().encode(str);
     const hashBuffer = await crypto.subtle.digest('SHA-1', buffer);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    const hexHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-    return hexHash;
+    return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-/**
- * 将简单通配符转换为正则表达式
- */
 export function wildcardToRegex(wildcard) {
     try {
         const escaped = wildcard.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
-        const regexString = escaped.replace(/\*/g, '.*'); 
-        return new RegExp(regexString, 'i');
+        return new RegExp(escaped.replace(/\*/g, '.*'), 'i');
     } catch (e) {
-        console.log(`Invalid wildcard pattern "${wildcard}" caused regex error: ${e.message}`);
         return null;
     }
 }
 
-/**
- * 循环解码 URL 字符串，直到其不再变化（处理多重编码）
- */
 export function fullDecode(str) {
-    let lastDecoded = str;
-    let currentDecoded = str;
-    let i = 0; 
-    while (i < 10) { 
+    let last = str, current = str, i = 0;
+    while (i < 5) {
         try {
-            currentDecoded = decodeURIComponent(lastDecoded);
-            if (currentDecoded === lastDecoded) return currentDecoded;
-            lastDecoded = currentDecoded;
-        } catch (e) {
-            return lastDecoded;
-        }
+            current = decodeURIComponent(last);
+            if (current === last) return current;
+            last = current;
+        } catch (e) { return last; }
         i++;
     }
-    return currentDecoded;
+    return current;
 }
 
 /**
- * 检查节点是否应被黑名单过滤
+ * 黑名单过滤检查
  */
 export function isBlacklisted(nodeString, blacklistRegexes) {
     if (!blacklistRegexes || blacklistRegexes.length === 0) return false;
-
-    // 1. 对整个字符串进行“循环 URL 解码”
     const testString = fullDecode(nodeString);
 
-    // 2. 第一次测试：测试解码后的完整字符串
     for (const regex of blacklistRegexes) {
         if (regex.test(testString)) return true;
     }
 
-    // 3. [vmess 专项] 处理 JSON 内部字段
     if (testString.startsWith('vmess://')) {
         try {
-            let base64Blob = testString.substring(8);
-            
-            // 修复 Base64URL 兼容性问题：替换特殊字符并补齐 '='
-            base64Blob = base64Blob.replace(/-/g, '+').replace(/_/g, '/');
-            const padding = base64Blob.length % 4;
-            if (padding !== 0) {
-                base64Blob += '='.repeat(4 - padding);
-            }
-            
-            const jsonString = atob(base64Blob);
+            const jsonString = safeBase64Decode(testString.substring(8));
             const vmessConfig = JSON.parse(jsonString);
-            
             if (vmessConfig && vmessConfig.ps) {
                 const nodeName = fullDecode(String(vmessConfig.ps));
                 for (const regex of blacklistRegexes) {
                     if (regex.test(nodeName)) return true;
                 }
             }
-        } catch (e) {
-            // 解析失败则跳过
-        }
+        } catch (e) {}
     }
     return false;
 }
