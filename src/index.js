@@ -287,35 +287,90 @@ export default {
             }
         }
 
-        // --- 路由 3：反向代理与分流逻辑 ---
+        // =================================================================
+        // --- 路由 3：反向代理与分流逻辑 (全面修复版) ---
+        // =================================================================
+
+        // 提取客户端真实 IP 与长连接协议类型
+        const clientIP = request.headers.get('CF-Connecting-IP');
+        const isWebSocket = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+
+        /**
+         * 统一通用反代发起函数
+         */
+        async function executeProxy(targetUrl, originalRequest, isWs) {
+            // 避免反代回 Worker 自身形成死循环
+            if (targetUrl.hostname === url.hostname) {
+                return new Response("Proxy Loop Detected", { status: 508 });
+            }
+
+            const proxyRequest = new Request(targetUrl.toString(), originalRequest);
+            
+            // 1. 修正 Host 标头（带端口）
+            proxyRequest.headers.set('Host', targetUrl.host);
+            proxyRequest.headers.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
+            
+            // 2. 透传真实客户端 IP
+            if (clientIP) {
+                proxyRequest.headers.set('X-Real-IP', clientIP);
+                proxyRequest.headers.set('X-Forwarded-For', clientIP);
+            }
+
+            // 3. 完整补齐 WebSocket 逐跳握手标头
+            if (isWs) {
+                proxyRequest.headers.set('Upgrade', 'websocket');
+                proxyRequest.headers.set('Connection', 'Upgrade');
+            }
+
+            const fetchOpts = { redirect: 'manual' };
+            if (originalRequest.body) {
+                fetchOpts.duplex = 'half';
+            }
+
+            return fetch(proxyRequest, fetchOpts);
+        }
+
+        // --- 3.1 规则路由匹配 ---
         const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
             if (routeRulesStr !== lastRouteRulesStr || !parsedRulesCache) {
                 parsedRulesCache = routeRulesStr.split('\n')
                     .map(l => l.trim())
-                    .filter(l => l)
+                    .filter(l => l && !l.startsWith('#'))
                     .map(rule => {
                         const parts = rule.split(':');
-                        if (parts.length >= 2) return { key: parts[0].trim(), target: parts.slice(1).join(':').trim() };
+                        if (parts.length >= 2) {
+                            // 容错处理：清除 key 误加的前后斜杠
+                            const rawKey = parts[0].trim().replace(/^\/+|\/+$/g, '');
+                            const rawTarget = parts.slice(1).join(':').trim();
+                            return { key: rawKey, target: rawTarget };
+                        }
                         return null;
                     }).filter(r => r !== null);
                 lastRouteRulesStr = routeRulesStr;
             }
 
             let matchedRule = null;
+            // A. 直接路径匹配
             for (const rule of parsedRulesCache) {
                 if (url.pathname === `/${rule.key}` || url.pathname.startsWith(`/${rule.key}/`)) {
-                    matchedRule = { ...rule, fromReferer: false }; break;
+                    matchedRule = { ...rule, fromReferer: false }; 
+                    break;
                 }
             }
+
+            // B. Referer 补充匹配（限制只能是当前 Worker 发出的 Referer）
             if (!matchedRule) {
                 const referer = request.headers.get('Referer');
                 if (referer) {
                     try {
                         const refererUrl = new URL(referer);
-                        for (const rule of parsedRulesCache) {
-                            if (refererUrl.pathname === `/${rule.key}` || refererUrl.pathname.startsWith(`/${rule.key}/`)) {
-                                matchedRule = { ...rule, fromReferer: true }; break;
+                        if (refererUrl.origin === url.origin) {
+                            for (const rule of parsedRulesCache) {
+                                if (refererUrl.pathname === `/${rule.key}` || refererUrl.pathname.startsWith(`/${rule.key}/`)) {
+                                    matchedRule = { ...rule, fromReferer: true }; 
+                                    break;
+                                }
                             }
                         }
                     } catch (e) {}
@@ -326,73 +381,82 @@ export default {
                 const { key } = matchedRule;
                 let { target } = matchedRule;
                 let keepPath = false; 
-                
-                const isWebSocket = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 
+                // 前缀符号解析
                 if (target.startsWith('*')) {
-                    keepPath = true; // 强制保留完整路径
-                    target = target.substring(1);
+                    keepPath = true; // 强制保留全路径
+                    target = target.substring(1).trim();
                 } else if (target.startsWith('^')) {
-                    // 【逻辑补全】^ 智能混合：WS 升级请求保留路径，HTTP 网页去除前缀路径
-                    keepPath = isWebSocket;
-                    target = target.substring(1);
+                    keepPath = isWebSocket; // 智能分流：WS 保留路径，网页去前缀
+                    target = target.substring(1).trim();
                 }
 
-                // 自适应协议：若目标带协议则尊重目标协议
+                // 协议解析与自适应
                 const protoMatch = target.match(/^(https?):\/\//i);
-                if (protoMatch) {
-                    url.protocol = protoMatch[1] + ':';
+                const targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : url.protocol;
+                const cleanTarget = target.replace(/^https?:\/\//i, '');
+
+                // 分离 Target 中的 Host 与 BasePath（防止截断目标已有子路径）
+                const slashIndex = cleanTarget.indexOf('/');
+                let targetHost = cleanTarget;
+                let targetBasePath = '';
+                if (slashIndex !== -1) {
+                    targetHost = cleanTarget.substring(0, slashIndex);
+                    targetBasePath = cleanTarget.substring(slashIndex).replace(/\/+$/, '');
                 }
-                
-                // 提取包含端口的 host 并赋值
-                url.host = target.replace(/^https?:\/\//i, '').split('/')[0];
-                
+
+                const targetUrl = new URL(url.toString());
+                targetUrl.protocol = targetProto;
+                targetUrl.host = targetHost;
+
+                // 路径重写
                 if (!matchedRule.fromReferer && !keepPath) {
-                    url.pathname = url.pathname.substring(key.length + 1);
-                    if (!url.pathname.startsWith('/')) url.pathname = '/' + url.pathname;
+                    let subPath = url.pathname.substring(key.length + 1);
+                    if (!subPath.startsWith('/')) subPath = '/' + subPath;
+                    targetUrl.pathname = targetBasePath + (subPath === '/' ? '' : subPath);
+                } else {
+                    targetUrl.pathname = targetBasePath + url.pathname;
                 }
-                
-                const proxyRequest = new Request(url.toString(), request);
-                // 修复：必须使用 url.host（带端口），不能用 url.hostname（丢失非标端口）
-                proxyRequest.headers.set('Host', url.host); 
-                proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-                
-                // 显式透传 WebSocket Header 防止边缘环境截断
-                if (isWebSocket) {
-                    proxyRequest.headers.set('Upgrade', 'websocket');
+
+                if (!targetUrl.pathname.startsWith('/')) {
+                    targetUrl.pathname = '/' + targetUrl.pathname;
                 }
-                
-                const fetchOpts = { redirect: 'manual' };
-                if (request.body) fetchOpts.duplex = 'half';
-                
-                return fetch(proxyRequest, fetchOpts);
+
+                return executeProxy(targetUrl, request, isWebSocket);
             }
         }
 
-        // 全局兜底反代
+        // --- 3.2 全局兜底反代 ---
         const proxyHost = await getKVCachedL1L2(request, env, ctx, "PROXY_HOSTNAME");
         if (proxyHost) {
-            const protoMatch = proxyHost.match(/^(https?):\/\//i);
-            if (protoMatch) {
-                url.protocol = protoMatch[1] + ':';
+            let targetHostStr = proxyHost.trim();
+            const protoMatch = targetHostStr.match(/^(https?):\/\//i);
+            const targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : url.protocol;
+            const cleanTarget = targetHostStr.replace(/^https?:\/\//i, '');
+
+            const slashIndex = cleanTarget.indexOf('/');
+            let targetHost = cleanTarget;
+            let targetBasePath = '';
+            if (slashIndex !== -1) {
+                targetHost = cleanTarget.substring(0, slashIndex);
+                targetBasePath = cleanTarget.substring(slashIndex).replace(/\/+$/, '');
             }
-            url.host = proxyHost.replace(/^https?:\/\//i, '').split('/')[0];
-            const proxyRequest = new Request(url.toString(), request);
-            proxyRequest.headers.set('Host', url.host);
-            proxyRequest.headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-            
-            const fetchOpts = { redirect: 'manual' };
-            if (request.body) fetchOpts.duplex = 'half';
-            
-            return fetch(proxyRequest, fetchOpts);
+
+            const targetUrl = new URL(url.toString());
+            targetUrl.protocol = targetProto;
+            targetUrl.host = targetHost;
+            targetUrl.pathname = targetBasePath + url.pathname;
+            if (!targetUrl.pathname.startsWith('/')) {
+                targetUrl.pathname = '/' + targetUrl.pathname;
+            }
+
+            return executeProxy(targetUrl, request, isWebSocket);
         }
 
-        // 根目录跳转
+        // --- 3.3 根目录跳转 ---
         const redirectURL = await getKVCachedL1L2(request, env, ctx, "ROOT_REDIRECT_URL");
         if (url.pathname === '/' && redirectURL) {
             try { return Response.redirect(redirectURL, 302); } catch (e) { }
         }
         
         return new Response(null, { status: 204 });
-    }
-};
