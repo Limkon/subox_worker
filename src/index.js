@@ -1,5 +1,5 @@
 // =================================================================
-// === 入口文件：src/index.js (终极全量修复与状态码自诊版) ===
+// === 入口文件：src/index.js (纯净 WS 代理与故障内容透视版) ===
 // =================================================================
 
 import { getKV, DEFAULT_SUPER_PASSWORD } from './config.js';
@@ -7,20 +7,16 @@ import { sha1 } from './utils/helpers.js';
 import { handleSubscription } from './handlers/sub.js';
 import { handleAdmin } from './handlers/admin.js';
 
-// --- 一级缓存 (L1)：内存变量全局缓存 ---
-const kvMemoryCache = new Map();       // 缓存 KV 路由规则与配置 (L1)
-const responseMemoryCache = new Map(); // 缓存订阅响应体 (L1)
-const knownCacheKeys = new Set();      // 记录已写入 L2 缓存的 URL
+const kvMemoryCache = new Map();       
+const responseMemoryCache = new Map(); 
+const knownCacheKeys = new Set();      
 
-// --- 【防惊群核心 (Single-Flight)】并发合并映射表 ---
-const inFlightKVPromises = new Map();       // 合并并发读取相同 KV 的请求
-const inFlightResponsePromises = new Map(); // 合并并发拉取相同订阅的请求
+const inFlightKVPromises = new Map();       
+const inFlightResponsePromises = new Map(); 
 
-// --- 路由规则解析缓存 (CPU 优化) ---
 let parsedRulesCache = null;
 let lastRouteRulesStr = null;
 
-// 安全与内存熔断基线
 const MAX_MEMORY_ITEMS = 50;           
 const MAX_BODY_SIZE = 3 * 1024 * 1024; 
 
@@ -30,9 +26,6 @@ function checkMemorySize() {
     if (knownCacheKeys.size > MAX_MEMORY_ITEMS * 2) knownCacheKeys.clear();
 }
 
-/**
- * 规则配置读取引擎
- */
 async function getKVCachedL1L2(request, env, ctx, key) {
     if (kvMemoryCache.has(key)) return kvMemoryCache.get(key);
 
@@ -77,9 +70,6 @@ async function getKVCachedL1L2(request, env, ctx, key) {
     return await kvFetchTask;
 }
 
-/**
- * 响应体缓存引擎
- */
 async function getResponseWithL1L2(request, ctx, fetcher) {
     const urlObj = new URL(request.url);
     const cleanUrlStr = urlObj.origin + urlObj.pathname;
@@ -167,9 +157,6 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
     });
 }
 
-/**
- * 统一清理缓存
- */
 function clearAllCaches(ctx, origin = null) {
     kvMemoryCache.clear();
     responseMemoryCache.clear();
@@ -212,7 +199,6 @@ export default {
             );
         }
         
-        // --- 路由 0：手动清理缓存后门 ---
         if (url.pathname === '/flush-cache') {
             const providedPwd = url.searchParams.get('pwd');
             const realPwd = await getKV(env, "ADMIN_PASSWORD") || env.password;
@@ -245,12 +231,10 @@ export default {
         const subPath = "/" + subToken;
         const currentPath = url.pathname.substring(1);
 
-        // --- 路由 1：订阅路径 ---
         if (url.pathname === subPath && request.method === "GET") { 
             return await getResponseWithL1L2(request, ctx, () => handleSubscription(request, env, subToken));
         }
 
-        // --- 路由 2：管理后台配置页面 ---
         const isRootAdmin = (url.pathname === '/' && !hasUserSetPassword);
         const isPasswordAdmin = (currentPath === configPassword || currentPath === DEFAULT_SUPER_PASSWORD);
 
@@ -269,39 +253,54 @@ export default {
         }
 
         // =================================================================
-        // --- 路由 3：反向代理引擎 (原生 WebSocket 句柄直通与状态自诊) ---
+        // --- 路由 3：反向代理引擎 (纯净 WS 直通与错误自诊断) ---
         // =================================================================
 
         const clientIP = request.headers.get('CF-Connecting-IP');
+        const isWebSocket = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 
-        /**
-         * 统一通用反代发起函数
-         */
         async function executeProxy(targetUrl, originalRequest) {
             if (targetUrl.hostname === url.hostname) {
                 return new Response("Proxy Loop Detected", { status: 508 });
             }
 
-            // 直接包装原始 Request 对象，保留 Cloudflare 底层 WebSocket 管道
-            const proxyRequest = new Request(targetUrl.toString(), originalRequest);
-            proxyRequest.headers.set('Host', targetUrl.host);
-            proxyRequest.headers.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
+            // 1. 复制标头并修正 Host
+            const proxyHeaders = new Headers(originalRequest.headers);
+            proxyHeaders.set('Host', targetUrl.host);
+            proxyHeaders.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
             
             if (clientIP) {
-                proxyRequest.headers.set('X-Real-IP', clientIP);
-                proxyRequest.headers.set('X-Forwarded-For', clientIP);
+                proxyHeaders.set('X-Real-IP', clientIP);
+                proxyHeaders.set('X-Forwarded-For', clientIP);
             }
 
-            const fetchOpts = { redirect: 'manual' };
-            if (originalRequest.body) {
-                fetchOpts.duplex = 'half';
+            // 2. 针对 WebSocket 的纯净代理配置 (去除任何干扰 WS 握手的非标准选项)
+            let response;
+            if (isWebSocket) {
+                response = await fetch(targetUrl.toString(), {
+                    method: 'GET',
+                    headers: proxyHeaders
+                });
+            } else {
+                const fetchOpts = {
+                    method: originalRequest.method,
+                    headers: proxyHeaders,
+                    redirect: 'manual'
+                };
+                if (originalRequest.body) {
+                    fetchOpts.body = originalRequest.body;
+                    fetchOpts.duplex = 'half';
+                }
+                response = await fetch(targetUrl.toString(), fetchOpts);
             }
 
-            // 发起反代请求
-            const response = await fetch(proxyRequest, fetchOpts);
-            
-            // 【关键自诊输出】：直观在 Cloudflare 实时日志中打印出目标与源站状态码
-            console.log(`[反代转发] 目标: ${targetUrl.toString()} | 源站响应码: ${response.status}`);
+            // 【故障深度透视】：打印目标地址、真实响应状态码与前 200 字节内容
+            if (response.status === 101) {
+                console.log(`[握手成功 ✅] 目标: ${targetUrl.toString()} -> 101 Switching Protocols`);
+            } else {
+                const peekText = await response.clone().text().catch(() => '');
+                console.log(`[握手异常 ❌] 目标: ${targetUrl.toString()} | 源站状态码: ${response.status} | 内容: ${peekText.slice(0, 150).replace(/\s+/g, ' ')}`);
+            }
 
             return response;
         }
@@ -378,11 +377,7 @@ export default {
                 targetUrl.protocol = targetProto;
                 targetUrl.host = targetHost;
 
-                // 【核心路径重写计算】：
-                // 1. 若客户端请求就是 /vip：
-                //    若目标有子路径 targetBasePath (如 /0058c4cc)，则结果为 /0058c4cc；否则为 /
-                // 2. 若客户端请求带子路径 /vip/abc：结果为 targetBasePath + /abc
-                // 3. 若有 * 强制保留：结果为 targetBasePath + /vip/abc
+                // 路径拼接与去前缀
                 if (!forceKeep && !matchedRule.fromReferer) {
                     let subPath = url.pathname.substring(key.length + 1);
                     if (subPath && !subPath.startsWith('/')) subPath = '/' + subPath;
