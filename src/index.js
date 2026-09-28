@@ -288,10 +288,38 @@ export default {
         }
 
         // =================================================================
-        // --- 路由 3：反向代理与分流逻辑 (全面修复版) ---
+        // --- 路由 3：反向代理与全协议分流逻辑 (严格语义与全节点兼容修复版) ---
         // =================================================================
 
-        // 提取客户端真实 IP 与长连接协议类型
+        // 1. 全协议节点流量特征检测器 (兼容 WS, XHTTP, gRPC, 二进制流)
+        function checkIsNodeTraffic(req) {
+            const headers = req.headers;
+            const upgrade = headers.get('Upgrade')?.toLowerCase();
+            if (upgrade === 'websocket' || headers.has('Sec-WebSocket-Key')) {
+                return true;
+            }
+
+            const contentType = (headers.get('Content-Type') || '').toLowerCase();
+            if (
+                contentType.includes('application/grpc') ||
+                contentType.includes('application/octet-stream') ||
+                contentType.includes('application/x-http') ||
+                contentType.includes('application/vnd.v2ray')
+            ) {
+                return true;
+            }
+
+            for (const [key] of headers) {
+                const k = key.toLowerCase();
+                if (k.startsWith('x-http-') || k.startsWith('sec-websocket-')) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        const isNode = checkIsNodeTraffic(request);
         const clientIP = request.headers.get('CF-Connecting-IP');
         const isWebSocket = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 
@@ -330,7 +358,7 @@ export default {
             return fetch(proxyRequest, fetchOpts);
         }
 
-        // --- 3.1 规则路由匹配 ---
+        // --- 3.1 严格规则路由匹配 ---
         const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
             if (routeRulesStr !== lastRouteRulesStr || !parsedRulesCache) {
@@ -340,10 +368,20 @@ export default {
                     .map(rule => {
                         const parts = rule.split(':');
                         if (parts.length >= 2) {
-                            // 容错处理：清除 key 误加的前后斜杠
                             const rawKey = parts[0].trim().replace(/^\/+|\/+$/g, '');
-                            const rawTarget = parts.slice(1).join(':').trim();
-                            return { key: rawKey, target: rawTarget };
+                            let rawTarget = parts.slice(1).join(':').trim();
+
+                            // 严格前缀解析：无符号 = 仅网页; * = 仅节点; ^ = 智能分流
+                            let mode = 'web';
+                            if (rawTarget.startsWith('*')) {
+                                mode = 'node';
+                                rawTarget = rawTarget.substring(1).trim();
+                            } else if (rawTarget.startsWith('^')) {
+                                mode = 'dual';
+                                rawTarget = rawTarget.substring(1).trim();
+                            }
+
+                            return { key: rawKey, target: rawTarget, mode };
                         }
                         return null;
                     }).filter(r => r !== null);
@@ -351,22 +389,27 @@ export default {
             }
 
             let matchedRule = null;
-            // A. 直接路径匹配
+            // A. 直接路径匹配（遵循严格规则类型准入）
             for (const rule of parsedRulesCache) {
                 if (url.pathname === `/${rule.key}` || url.pathname.startsWith(`/${rule.key}/`)) {
+                    // 无符号仅允许网页；* 仅允许节点；^ 允许全部
+                    if (rule.mode === 'web' && isNode) continue;
+                    if (rule.mode === 'node' && !isNode) continue;
+
                     matchedRule = { ...rule, fromReferer: false }; 
                     break;
                 }
             }
 
-            // B. Referer 补充匹配（限制只能是当前 Worker 发出的 Referer）
-            if (!matchedRule) {
+            // B. Referer 补充匹配（仅限普通网页资源请求）
+            if (!matchedRule && !isNode) {
                 const referer = request.headers.get('Referer');
                 if (referer) {
                     try {
                         const refererUrl = new URL(referer);
                         if (refererUrl.origin === url.origin) {
                             for (const rule of parsedRulesCache) {
+                                if (rule.mode === 'node') continue; 
                                 if (refererUrl.pathname === `/${rule.key}` || refererUrl.pathname.startsWith(`/${rule.key}/`)) {
                                     matchedRule = { ...rule, fromReferer: true }; 
                                     break;
@@ -378,18 +421,10 @@ export default {
             }
 
             if (matchedRule) {
-                const { key } = matchedRule;
-                let { target } = matchedRule;
-                let keepPath = false; 
+                const { key, target, mode } = matchedRule;
 
-                // 前缀符号解析
-                if (target.startsWith('*')) {
-                    keepPath = true; // 强制保留全路径
-                    target = target.substring(1).trim();
-                } else if (target.startsWith('^')) {
-                    keepPath = isWebSocket; // 智能分流：WS 保留路径，网页去前缀
-                    target = target.substring(1).trim();
-                }
+                // 节点流量必须保留全路径；网页流量执行去除前缀
+                const keepPath = (mode === 'node') || (mode === 'dual' && isNode);
 
                 // 协议解析与自适应
                 const protoMatch = target.match(/^(https?):\/\//i);
@@ -409,7 +444,7 @@ export default {
                 targetUrl.protocol = targetProto;
                 targetUrl.host = targetHost;
 
-                // 路径重写
+                // 路径重写：节点流量完整保留原路径，网页流量去前缀
                 if (!matchedRule.fromReferer && !keepPath) {
                     let subPath = url.pathname.substring(key.length + 1);
                     if (!subPath.startsWith('/')) subPath = '/' + subPath;
