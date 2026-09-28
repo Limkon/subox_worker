@@ -194,11 +194,9 @@ function clearAllCaches(ctx, origin = null) {
 }
 
 /**
- * 原生全流反向代理执行器
- * 核心修复：
- * 1. 彻底解决 WebSocket 握手时 Sec-WebSocket-Key 等关键标头丢失导致的 “连接 -1”
- * 2. 避免对 GET/HEAD 请求设置请求体或 duplex 导致的 Runtime 崩溃
- * 3. 完美支持 Early-Data 0-RTT 透传及 X-Forwarded / Host 修正
+ * 原生全流反向代理执行器（原生隧道透传修复版）
+ * 核心：必须使用 new Request(targetUrl, originalRequest) 将客户端的 WebSocket 管道
+ * 与出站请求牢牢绑定，Cloudflare 才会透明转发 101 Switching Protocols。
  */
 async function executeProxy(targetUrl, originalRequest, isWs, clientIP, currentHostname) {
     // 避免反代回 Worker 自身形成死循环
@@ -206,40 +204,35 @@ async function executeProxy(targetUrl, originalRequest, isWs, clientIP, currentH
         return new Response("Proxy Loop Detected: Target points to the Worker itself", { status: 508 });
     }
 
-    // 深度保留 Sec-WebSocket-*、User-Agent 等全部原始字段
-    const proxyHeaders = new Headers(originalRequest.headers);
+    // 基于原始请求构建出站请求（继承底层 WebSocket 管道与所有原始标头）
+    const proxyRequest = new Request(targetUrl.toString(), originalRequest);
     
     // 1. 修正 Host 标头（带端口）与反向代理协议
-    proxyHeaders.set('Host', targetUrl.host);
-    proxyHeaders.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
+    proxyRequest.headers.set('Host', targetUrl.host);
+    proxyRequest.headers.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
     
     // 2. 透传客户端真实 IP
     if (clientIP) {
-        proxyHeaders.set('X-Real-IP', clientIP);
+        proxyRequest.headers.set('X-Real-IP', clientIP);
         const existingXFF = originalRequest.headers.get('X-Forwarded-For');
-        proxyHeaders.set('X-Forwarded-For', existingXFF ? `${existingXFF}, ${clientIP}` : clientIP);
+        proxyRequest.headers.set('X-Forwarded-For', existingXFF ? `${existingXFF}, ${clientIP}` : clientIP);
     }
 
-    // 3. 确保 WebSocket 升级标头完备
+    // 3. 补齐 WebSocket 逐跳握手标头
     if (isWs) {
-        proxyHeaders.set('Upgrade', 'websocket');
-        proxyHeaders.set('Connection', 'Upgrade');
+        proxyRequest.headers.set('Upgrade', 'websocket');
+        proxyRequest.headers.set('Connection', 'Upgrade');
     }
 
-    const fetchOpts = {
-        method: originalRequest.method,
-        headers: proxyHeaders,
-        redirect: 'manual'
-    };
-
-    // 4. 请求体处理：GET/HEAD 严禁设置 body 与 duplex，非 GET 请求且有载荷时开启流式转发
+    const fetchOpts = { redirect: 'manual' };
+    
+    // 4. 严禁对 GET/HEAD 设置 duplex，非 GET 且有请求体时开启流式上传
     const methodUpper = originalRequest.method.toUpperCase();
     if (methodUpper !== 'GET' && methodUpper !== 'HEAD' && originalRequest.body) {
-        fetchOpts.body = originalRequest.body;
         fetchOpts.duplex = 'half';
     }
 
-    return fetch(targetUrl.toString(), fetchOpts);
+    return fetch(proxyRequest, fetchOpts);
 }
 
 export default {
