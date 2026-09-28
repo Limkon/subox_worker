@@ -35,45 +35,24 @@ function checkMemorySize() {
 
 /**
  * 【规则配置缓存引擎 + 防惊群保护】
+ * 核心优化：仅使用高效 L1 内存缓存与 KV 原生边缘缓存，彻底移除 Cache API 二级持久化，
+ * 杜绝空密码或旧配置在边缘节点被持久缓存导致权限判断失控。
  */
-async function getKVCachedL1L2(request, env, ctx, key) {
+async function getKVCachedL1(request, env, ctx, key) {
     // 1. L1 内存直接命中
     if (kvMemoryCache.has(key)) return kvMemoryCache.get(key);
 
-    // 2. 防惊群：若当前已有其他请求正在读取该 key，直接挂起复用其 Promise
+    // 2. 防惊群：若当前已有其他并发请求正在读取该 key，挂起复用同一个 Promise
     if (inFlightKVPromises.has(key)) {
         return await inFlightKVPromises.get(key);
     }
 
     const kvFetchTask = (async () => {
         try {
-            const url = new URL(request.url);
-            const dummyUrlStr = `${url.origin}/__internal_kv_cache/${key}`;
-            const dummyReq = new Request(dummyUrlStr, { method: 'GET' });
-            const edgeCache = caches.default;
-
-            // 检查 L2 (Cache API)
-            const l2Res = await edgeCache.match(dummyReq);
-            if (l2Res) {
-                const val = await l2Res.text();
-                checkMemorySize();
-                kvMemoryCache.set(key, val);
-                knownCacheKeys.add(dummyUrlStr);
-                return val;
-            }
-
-            // 读取底层 KV
-            const val = await getKV(env, key) || "";
+            // 直接读取底层 KV（Cloudflare KV 原生自带边缘缓存，毫秒级读取且更新能即时同步）
+            const val = (await getKV(env, key)) || "";
             checkMemorySize();
             kvMemoryCache.set(key, val);
-
-            const cacheRes = new Response(val, { 
-                status: 200,
-                headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'max-age=31536000' }
-            });
-            ctx.waitUntil(edgeCache.put(dummyReq, cacheRes));
-            knownCacheKeys.add(dummyUrlStr);
-
             return val;
         } finally {
             inFlightKVPromises.delete(key); // 释放飞行记录
@@ -202,6 +181,7 @@ function clearAllCaches(ctx, origin = null) {
     }
     knownCacheKeys.clear();
 
+    // 强力清除任何旧版本遗留的内部 KV 缓存条目
     if (origin) {
         const internalKvKeys = ["ADMIN_PASSWORD", "SUB_EXPIRY_DAYS", "ROUTE_RULES", "PROXY_HOSTNAME", "ROOT_REDIRECT_URL", "SUB_LIST_URLS", "SUB_BLACKLIST"];
         for (const kvKey of internalKvKeys) {
@@ -226,7 +206,7 @@ async function executeProxy(targetUrl, originalRequest, isWs, clientIP, currentH
         return new Response("Proxy Loop Detected: Target points to the Worker itself", { status: 508 });
     }
 
-    // 复制原始请求所有标头（深度保留 Sec-WebSocket-*、User-Agent 等全部字段）
+    // 深度保留 Sec-WebSocket-*、User-Agent 等全部原始字段
     const proxyHeaders = new Headers(originalRequest.headers);
     
     // 1. 修正 Host 标头（带端口）与反向代理协议
@@ -280,7 +260,7 @@ export default {
         // --- 路由 0：手动强力清洗后门 (保留超级密码校验) ---
         if (url.pathname === '/flush-cache') {
             const providedPwd = url.searchParams.get('pwd');
-            const realPwd = await getKV(env, "ADMIN_PASSWORD") || env.password;
+            const realPwd = (await getKV(env, "ADMIN_PASSWORD")) || env.password;
             
             // 后门机制：只要是真实密码或默认超级密码，均允许清理
             if (providedPwd && (providedPwd === realPwd || providedPwd === DEFAULT_SUPER_PASSWORD)) {
@@ -293,12 +273,14 @@ export default {
             }
         }
 
-        const kvPassword = await getKVCachedL1L2(request, env, ctx, "ADMIN_PASSWORD");
-        const envPassword = env.password; 
+        // 密码精准获取（不经过 L2 Cache API，消除缓存毒化）
+        const rawKvPassword = await getKVCachedL1(request, env, ctx, "ADMIN_PASSWORD");
+        const kvPassword = (rawKvPassword || "").trim();
+        const envPassword = (env.password || "").trim(); 
         const hasUserSetPassword = !!(kvPassword || envPassword);
         const configPassword = kvPassword || envPassword || DEFAULT_SUPER_PASSWORD;
         
-        const expiryDays = parseInt(await getKVCachedL1L2(request, env, ctx, "SUB_EXPIRY_DAYS") || "0", 10);
+        const expiryDays = parseInt(await getKVCachedL1(request, env, ctx, "SUB_EXPIRY_DAYS") || "0", 10);
         let inputForHash = configPassword;
         if (expiryDays > 0) {
             const periodLengthMs = expiryDays * 86400000;
@@ -309,17 +291,20 @@ export default {
         const hash = await sha1(inputForHash);
         const subToken = hash.substring(0, 6);
         const subPath = "/" + subToken;
-        const currentPath = url.pathname.substring(1);
+
+        // 规范化当前路径（去除首尾斜杠，精准识别路径语义）
+        const normalizedPath = url.pathname.replace(/^\/+|\/+$/g, '');
 
         // --- 路由 1：订阅路径 (全量防惊群 + L1/L2 防击穿保护) ---
         if (url.pathname === subPath && request.method === "GET") { 
             return await getResponseWithL1L2(request, ctx, () => handleSubscription(request, env, subToken));
         }
 
-        // --- 路由 2：管理后台配置页面 (保留超级密码后门机制) ---
+        // --- 路由 2：管理后台配置页面 (严格权限隔离) ---
+        // 只有从未设置过密码时，才允许通过根路径 "/" 访问后台！
         const isRootAdmin = (url.pathname === '/' && !hasUserSetPassword);
-        // 【后门保留】：任何时候，只要访问超级密码路径，一律放行
-        const isPasswordAdmin = (currentPath === configPassword || currentPath === DEFAULT_SUPER_PASSWORD);
+        // 设置密码后，必须输入正确的密码路径或超级密码路径
+        const isPasswordAdmin = normalizedPath && (normalizedPath === configPassword || normalizedPath === DEFAULT_SUPER_PASSWORD);
 
         if (isRootAdmin || isPasswordAdmin) { 
             if (request.method === "GET") {
@@ -344,7 +329,7 @@ export default {
         const isWebSocket = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 
         // --- 3.1 规则路由匹配 (前缀剥离与挂载全流反代) ---
-        const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
+        const routeRulesStr = await getKVCachedL1(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
             if (routeRulesStr !== lastRouteRulesStr || !parsedRulesCache) {
                 parsedRulesCache = routeRulesStr.split('\n')
@@ -459,7 +444,7 @@ export default {
         }
 
         // --- 3.2 全局兜底反代 ---
-        const proxyHost = await getKVCachedL1L2(request, env, ctx, "PROXY_HOSTNAME");
+        const proxyHost = await getKVCachedL1(request, env, ctx, "PROXY_HOSTNAME");
         if (proxyHost) {
             let targetHostStr = proxyHost.trim();
             const protoMatch = targetHostStr.match(/^(https?):\/\//i);
@@ -493,7 +478,7 @@ export default {
         }
 
         // --- 3.3 根目录跳转 ---
-        const redirectURL = await getKVCachedL1L2(request, env, ctx, "ROOT_REDIRECT_URL");
+        const redirectURL = await getKVCachedL1(request, env, ctx, "ROOT_REDIRECT_URL");
         if (url.pathname === '/' && redirectURL) {
             try { return Response.redirect(redirectURL, 302); } catch (e) { }
         }
