@@ -1,5 +1,5 @@
 // =================================================================
-// === 入口文件：src/index.js (官方标准 WS 双向隧道缝合版) ===
+// === 入口文件：src/index.js ===
 // =================================================================
 
 import { getKV, DEFAULT_SUPER_PASSWORD } from './config.js';
@@ -7,28 +7,40 @@ import { sha1 } from './utils/helpers.js';
 import { handleSubscription } from './handlers/sub.js';
 import { handleAdmin } from './handlers/admin.js';
 
-const kvMemoryCache = new Map();       
-const responseMemoryCache = new Map(); 
-const knownCacheKeys = new Set();      
+// --- 一级缓存 (L1)：内存变量全局缓存 ---
+const kvMemoryCache = new Map();       // 缓存 KV 路由规则与配置 (L1)
+const responseMemoryCache = new Map(); // 缓存订阅响应体 (L1)
+const knownCacheKeys = new Set();      // 记录已写入 L2 缓存的 URL
 
-const inFlightKVPromises = new Map();       
-const inFlightResponsePromises = new Map(); 
+// --- 【防惊群核心 (Single-Flight)】并发合并映射表 ---
+const inFlightKVPromises = new Map();       // 合并并发读取相同 KV 的请求
+const inFlightResponsePromises = new Map(); // 合并并发拉取相同订阅的请求
 
+// --- 路由规则解析缓存 (CPU 优化) ---
 let parsedRulesCache = null;
 let lastRouteRulesStr = null;
 
-const MAX_MEMORY_ITEMS = 50;           
-const MAX_BODY_SIZE = 3 * 1024 * 1024; 
+// 安全与内存熔断基线
+const MAX_MEMORY_ITEMS = 50;           // 适度缩小防 OOM
+const MAX_BODY_SIZE = 3 * 1024 * 1024; // 限制单条内存缓存最大 3MB
 
+/**
+ * 内存容量熔断保护器
+ */
 function checkMemorySize() {
     if (kvMemoryCache.size > MAX_MEMORY_ITEMS) kvMemoryCache.clear();
     if (responseMemoryCache.size > MAX_MEMORY_ITEMS) responseMemoryCache.clear();
     if (knownCacheKeys.size > MAX_MEMORY_ITEMS * 2) knownCacheKeys.clear();
 }
 
+/**
+ * 【规则配置缓存引擎 + 防惊群保护】
+ */
 async function getKVCachedL1L2(request, env, ctx, key) {
+    // 1. L1 内存直接命中
     if (kvMemoryCache.has(key)) return kvMemoryCache.get(key);
 
+    // 2. 防惊群：若当前已有其他请求正在读取该 key，直接挂起复用其 Promise
     if (inFlightKVPromises.has(key)) {
         return await inFlightKVPromises.get(key);
     }
@@ -40,6 +52,7 @@ async function getKVCachedL1L2(request, env, ctx, key) {
             const dummyReq = new Request(dummyUrlStr, { method: 'GET' });
             const edgeCache = caches.default;
 
+            // 检查 L2 (Cache API)
             const l2Res = await edgeCache.match(dummyReq);
             if (l2Res) {
                 const val = await l2Res.text();
@@ -49,6 +62,7 @@ async function getKVCachedL1L2(request, env, ctx, key) {
                 return val;
             }
 
+            // 读取底层 KV
             const val = await getKV(env, key) || "";
             checkMemorySize();
             kvMemoryCache.set(key, val);
@@ -62,7 +76,7 @@ async function getKVCachedL1L2(request, env, ctx, key) {
 
             return val;
         } finally {
-            inFlightKVPromises.delete(key);
+            inFlightKVPromises.delete(key); // 释放飞行记录
         }
     })();
 
@@ -70,11 +84,16 @@ async function getKVCachedL1L2(request, env, ctx, key) {
     return await kvFetchTask;
 }
 
+/**
+ * 【响应体缓存引擎 + 防惊群/击穿保护】
+ * 使用 ArrayBuffer 安全分发，避免多请求共享流导致的 "Body already used" 错误
+ */
 async function getResponseWithL1L2(request, ctx, fetcher) {
     const urlObj = new URL(request.url);
     const cleanUrlStr = urlObj.origin + urlObj.pathname;
     const cacheReq = new Request(cleanUrlStr, { method: 'GET' });
 
+    // 1. L1 内存快速命中
     if (responseMemoryCache.has(cleanUrlStr)) {
         const cached = responseMemoryCache.get(cleanUrlStr);
         return new Response(cached.body.slice(0), {
@@ -83,6 +102,7 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
         });
     }
 
+    // 2. 防惊群 (Single-Flight) 拦截：多个并发请求同时到达时，等待第一个任务完成并共享数据
     if (inFlightResponsePromises.has(cleanUrlStr)) {
         const sharedData = await inFlightResponsePromises.get(cleanUrlStr);
         return new Response(sharedData.body.slice(0), {
@@ -91,8 +111,10 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
         });
     }
 
+    // 3. 创建独占的任务执行体
     const singleFlightTask = (async () => {
         try {
+            // 尝试读取 L2 (边缘 Cache API)
             const edgeCache = caches.default;
             const l2Response = await edgeCache.match(cacheReq);
             if (l2Response) {
@@ -110,8 +132,10 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
                 return cacheItem;
             }
 
+            // 执行真实运算/抓取
             const response = await fetcher();
 
+            // 异常响应（如 502/504 上游拉取失败）直接放行，禁止缓存！
             if (!response || response.status !== 200) {
                 const errBuf = response ? await response.arrayBuffer() : new ArrayBuffer(0);
                 return {
@@ -128,11 +152,13 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
                 headers: Array.from(response.headers.entries())
             };
 
+            // 写入 L1 内存
             if (bodyBuf.byteLength <= MAX_BODY_SIZE) {
                 checkMemorySize();
                 responseMemoryCache.set(cleanUrlStr, cacheItem);
             }
 
+            // 写入 L2 缓存 (剥离 Cookie 并标记一年缓存)
             const l2CacheHeaders = new Headers(response.headers);
             l2CacheHeaders.set('Cache-Control', 'max-age=31536000');
             l2CacheHeaders.delete('Set-Cookie');
@@ -145,7 +171,7 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
 
             return cacheItem;
         } finally {
-            inFlightResponsePromises.delete(cleanUrlStr);
+            inFlightResponsePromises.delete(cleanUrlStr); // 任务结束，释放并发锁
         }
     })();
 
@@ -157,6 +183,9 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
     });
 }
 
+/**
+ * 统一清理缓存
+ */
 function clearAllCaches(ctx, origin = null) {
     kvMemoryCache.clear();
     responseMemoryCache.clear();
@@ -184,6 +213,55 @@ function clearAllCaches(ctx, origin = null) {
     }
 }
 
+/**
+ * 原生全流反向代理执行器
+ * 核心修复：
+ * 1. 彻底解决 WebSocket 握手时 Sec-WebSocket-Key 等关键标头丢失导致的 “连接 -1”
+ * 2. 避免对 GET/HEAD 请求设置请求体或 duplex 导致的 Runtime 崩溃
+ * 3. 完美支持 Early-Data 0-RTT 透传及 X-Forwarded / Host 修正
+ */
+async function executeProxy(targetUrl, originalRequest, isWs, clientIP, currentHostname) {
+    // 避免反代回 Worker 自身形成死循环
+    if (targetUrl.hostname === currentHostname) {
+        return new Response("Proxy Loop Detected: Target points to the Worker itself", { status: 508 });
+    }
+
+    // 复制原始请求所有标头（深度保留 Sec-WebSocket-*、User-Agent 等全部字段）
+    const proxyHeaders = new Headers(originalRequest.headers);
+    
+    // 1. 修正 Host 标头（带端口）与反向代理协议
+    proxyHeaders.set('Host', targetUrl.host);
+    proxyHeaders.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
+    
+    // 2. 透传客户端真实 IP
+    if (clientIP) {
+        proxyHeaders.set('X-Real-IP', clientIP);
+        const existingXFF = originalRequest.headers.get('X-Forwarded-For');
+        proxyHeaders.set('X-Forwarded-For', existingXFF ? `${existingXFF}, ${clientIP}` : clientIP);
+    }
+
+    // 3. 确保 WebSocket 升级标头完备
+    if (isWs) {
+        proxyHeaders.set('Upgrade', 'websocket');
+        proxyHeaders.set('Connection', 'Upgrade');
+    }
+
+    const fetchOpts = {
+        method: originalRequest.method,
+        headers: proxyHeaders,
+        redirect: 'manual'
+    };
+
+    // 4. 请求体处理：GET/HEAD 严禁设置 body 与 duplex，非 GET 请求且有载荷时开启流式转发
+    const methodUpper = originalRequest.method.toUpperCase();
+    if (methodUpper !== 'GET' && methodUpper !== 'HEAD' && originalRequest.body) {
+        fetchOpts.body = originalRequest.body;
+        fetchOpts.duplex = 'half';
+    }
+
+    return fetch(targetUrl.toString(), fetchOpts);
+}
+
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
@@ -199,13 +277,15 @@ export default {
             );
         }
         
+        // --- 路由 0：手动强力清洗后门 (保留超级密码校验) ---
         if (url.pathname === '/flush-cache') {
             const providedPwd = url.searchParams.get('pwd');
             const realPwd = await getKV(env, "ADMIN_PASSWORD") || env.password;
             
+            // 后门机制：只要是真实密码或默认超级密码，均允许清理
             if (providedPwd && (providedPwd === realPwd || providedPwd === DEFAULT_SUPER_PASSWORD)) {
                 clearAllCaches(ctx, url.origin);
-                return new Response("✅ 缓存已全部清洗完成！", {
+                return new Response("✅ 终极双重缓存架构已全部清洗完成！", {
                     status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' }
                 });
             } else {
@@ -231,15 +311,19 @@ export default {
         const subPath = "/" + subToken;
         const currentPath = url.pathname.substring(1);
 
+        // --- 路由 1：订阅路径 (全量防惊群 + L1/L2 防击穿保护) ---
         if (url.pathname === subPath && request.method === "GET") { 
             return await getResponseWithL1L2(request, ctx, () => handleSubscription(request, env, subToken));
         }
 
+        // --- 路由 2：管理后台配置页面 (保留超级密码后门机制) ---
         const isRootAdmin = (url.pathname === '/' && !hasUserSetPassword);
+        // 【后门保留】：任何时候，只要访问超级密码路径，一律放行
         const isPasswordAdmin = (currentPath === configPassword || currentPath === DEFAULT_SUPER_PASSWORD);
 
         if (isRootAdmin || isPasswordAdmin) { 
             if (request.method === "GET") {
+                // 安全隔离：管理后台严禁进入持久 L2 缓存
                 const adminRes = await handleAdmin(request, env, configPassword, subToken);
                 adminRes.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
                 return adminRes;
@@ -253,45 +337,13 @@ export default {
         }
 
         // =================================================================
-        // --- 路由 3：反向代理引擎 (标准双向 WS 管道与流转发) ---
+        // --- 路由 3：全流反向代理与路由分流逻辑 ---
         // =================================================================
 
         const clientIP = request.headers.get('CF-Connecting-IP');
         const isWebSocket = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 
-        /**
-         * 统一通用反代发起函数
-         */
-        async function executeProxy(targetUrl, originalRequest) {
-            if (targetUrl.hostname === url.hostname) {
-                return new Response("Proxy Loop Detected", { status: 508 });
-            }
-
-            // 【关键技术点】：直接基于 originalRequest 构造 proxyRequest
-            // Cloudflare 运行时检测到原始 Request 包含 WS 会话时，会原生挂接双向 WebSocket 管道！
-            const proxyRequest = new Request(targetUrl.toString(), originalRequest);
-            proxyRequest.headers.set('Host', targetUrl.host);
-            proxyRequest.headers.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
-            
-            if (clientIP) {
-                proxyRequest.headers.set('X-Real-IP', clientIP);
-                proxyRequest.headers.set('X-Forwarded-For', clientIP);
-            }
-
-            // 针对 WebSocket 代理，直接返回原生 fetch，绝对不传 options 干扰管道缝合
-            if (isWebSocket) {
-                return fetch(proxyRequest);
-            }
-
-            // 普通 HTTP / POST 请求
-            const fetchOpts = { redirect: 'manual' };
-            if (originalRequest.body) {
-                fetchOpts.duplex = 'half';
-            }
-            return fetch(proxyRequest, fetchOpts);
-        }
-
-        // --- 3.1 规则路由匹配 ---
+        // --- 3.1 规则路由匹配 (前缀剥离与挂载全流反代) ---
         const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
             if (routeRulesStr !== lastRouteRulesStr || !parsedRulesCache) {
@@ -301,18 +353,12 @@ export default {
                     .map(rule => {
                         const parts = rule.split(':');
                         if (parts.length >= 2) {
+                            // 清除 key 前后的斜杠与多余空格
                             const rawKey = parts[0].trim().replace(/^\/+|\/+$/g, '');
-                            let rawTarget = parts.slice(1).join(':').trim();
-
-                            let forceKeep = false;
-                            if (rawTarget.startsWith('*')) {
-                                forceKeep = true;
-                                rawTarget = rawTarget.substring(1).trim();
-                            } else if (rawTarget.startsWith('^')) {
-                                rawTarget = rawTarget.substring(1).trim();
+                            const rawTarget = parts.slice(1).join(':').trim();
+                            if (rawKey && rawTarget) {
+                                return { key: rawKey, target: rawTarget };
                             }
-
-                            return { key: rawKey, target: rawTarget, forceKeep };
                         }
                         return null;
                     }).filter(r => r !== null);
@@ -320,6 +366,7 @@ export default {
             }
 
             let matchedRule = null;
+            // A. 直接路径匹配 (例如 /v1 或 /v1/...)
             for (const rule of parsedRulesCache) {
                 if (url.pathname === `/${rule.key}` || url.pathname.startsWith(`/${rule.key}/`)) {
                     matchedRule = { ...rule, fromReferer: false }; 
@@ -327,6 +374,7 @@ export default {
                 }
             }
 
+            // B. Referer 补充匹配（同源跨资源引用兜底）
             if (!matchedRule) {
                 const referer = request.headers.get('Referer');
                 if (referer) {
@@ -345,37 +393,68 @@ export default {
             }
 
             if (matchedRule) {
-                const { key, target, forceKeep } = matchedRule;
+                const { key, target } = matchedRule;
 
+                // 目标协议与主机解析
                 const protoMatch = target.match(/^(https?):\/\//i);
-                const targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : url.protocol;
+                let targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : null;
                 const cleanTarget = target.replace(/^https?:\/\//i, '');
 
+                // 分离 Target 中的 Host 与 BasePath（例如 A.com:8443 或 B.com/custom_path）
                 const slashIndex = cleanTarget.indexOf('/');
                 let targetHost = cleanTarget;
                 let targetBasePath = '';
                 if (slashIndex !== -1) {
-                    targetHost = cleanTarget.substring(0, slashIndex);
+                    targetHost = cleanTarget.substring(0, slashIndex).trim();
                     targetBasePath = cleanTarget.substring(slashIndex).replace(/\/+$/, '');
-                }
-
-                const targetUrl = new URL(url.toString());
-                targetUrl.protocol = targetProto;
-                targetUrl.host = targetHost;
-
-                if (!forceKeep && !matchedRule.fromReferer) {
-                    let subPath = url.pathname.substring(key.length + 1);
-                    if (subPath && !subPath.startsWith('/')) subPath = '/' + subPath;
-                    targetUrl.pathname = targetBasePath + (subPath || '');
                 } else {
-                    targetUrl.pathname = targetBasePath + url.pathname;
+                    targetHost = cleanTarget.trim();
                 }
 
-                if (!targetUrl.pathname.startsWith('/')) {
-                    targetUrl.pathname = '/' + targetUrl.pathname;
+                // 若未指定协议，智能判断端口：80/8080 走 http，其余默认 https
+                if (!targetProto) {
+                    const portMatch = targetHost.match(/:(\d+)$/);
+                    if (portMatch && (portMatch[1] === '80' || portMatch[1] === '8080')) {
+                        targetProto = 'http:';
+                    } else {
+                        targetProto = 'https:';
+                    }
                 }
 
-                return executeProxy(targetUrl, request);
+                // 采用全新目标 URL 实例，防止原 URL 端口与属性残留污染
+                const targetUrl = new URL(`${targetProto}//${targetHost}`);
+
+                // 核心：全流前缀剥离与映射算法
+                let subPath = '';
+                if (matchedRule.fromReferer) {
+                    // 来自 Referer 跨资源引用的相对请求，完整保留原路径
+                    subPath = url.pathname;
+                } else {
+                    // 直接访问：精准剥离 /key，若为根则返回 /
+                    if (url.pathname === `/${key}` || url.pathname === `/${key}/`) {
+                        subPath = '/';
+                    } else if (url.pathname.startsWith(`/${key}/`)) {
+                        subPath = url.pathname.slice(key.length + 1);
+                    } else {
+                        subPath = '/';
+                    }
+                }
+
+                if (!subPath.startsWith('/')) {
+                    subPath = '/' + subPath;
+                }
+
+                // 拼装最终请求路径：如果目标本身有 BasePath 则挂载拼接，无则为 subPath
+                if (targetBasePath) {
+                    targetUrl.pathname = targetBasePath + (subPath === '/' ? '' : subPath);
+                } else {
+                    targetUrl.pathname = subPath;
+                }
+
+                // 100% 原始透传查询参数（如 ?ed=2048、token 等）
+                targetUrl.search = url.search;
+
+                return executeProxy(targetUrl, request, isWebSocket, clientIP, url.hostname);
             }
         }
 
@@ -384,26 +463,33 @@ export default {
         if (proxyHost) {
             let targetHostStr = proxyHost.trim();
             const protoMatch = targetHostStr.match(/^(https?):\/\//i);
-            const targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : url.protocol;
+            let targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : null;
             const cleanTarget = targetHostStr.replace(/^https?:\/\//i, '');
 
             const slashIndex = cleanTarget.indexOf('/');
             let targetHost = cleanTarget;
             let targetBasePath = '';
             if (slashIndex !== -1) {
-                targetHost = cleanTarget.substring(0, slashIndex);
+                targetHost = cleanTarget.substring(0, slashIndex).trim();
                 targetBasePath = cleanTarget.substring(slashIndex).replace(/\/+$/, '');
+            } else {
+                targetHost = cleanTarget.trim();
             }
 
-            const targetUrl = new URL(url.toString());
-            targetUrl.protocol = targetProto;
-            targetUrl.host = targetHost;
+            if (!targetProto) {
+                const portMatch = targetHost.match(/:(\d+)$/);
+                if (portMatch && (portMatch[1] === '80' || portMatch[1] === '8080')) {
+                    targetProto = 'http:';
+                } else {
+                    targetProto = 'https:';
+                }
+            }
+
+            const targetUrl = new URL(`${targetProto}//${targetHost}`);
             targetUrl.pathname = targetBasePath + url.pathname;
-            if (!targetUrl.pathname.startsWith('/')) {
-                targetUrl.pathname = '/' + targetUrl.pathname;
-            }
+            targetUrl.search = url.search;
 
-            return executeProxy(targetUrl, request);
+            return executeProxy(targetUrl, request, isWebSocket, clientIP, url.hostname);
         }
 
         // --- 3.3 根目录跳转 ---
