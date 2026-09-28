@@ -2,12 +2,12 @@
 // === 订阅处理模块：src/handlers/sub.js ===
 // =================================================================
 
-import { getKV, CHUNK_SIZE } from '../config.js';
-import { fetchWithRetry, wildcardToRegex, isBlacklisted } from '../utils/helpers.js';
+import { getKV } from '../config.js';
+import { fetchWithRetry, wildcardToRegex, isBlacklisted, safeBase64Encode } from '../utils/helpers.js';
 import { detectAndProcess } from '../utils/detector.js';
 
 /**
- * 处理订阅请求
+ * 处理订阅请求 (容错增强与黑名单深度修复版)
  * @param {Request} request 请求对象
  * @param {object} env 环境变量
  * @param {string} subToken 匹配成功的订阅 Token
@@ -15,13 +15,13 @@ import { detectAndProcess } from '../utils/detector.js';
 export async function handleSubscription(request, env, subToken) {
     const uniqueStrings = new Set();
     
-    // 获取订阅源列表和黑名单设置
+    // 1. 获取订阅源列表和黑名单设置
     const subListUrls = await getKV(env, "SUB_LIST_URLS") || "";
     const blacklistKeywordsRaw = await getKV(env, "SUB_BLACKLIST") || "";
     
-    // 将黑名单关键字转换为正则表达式
+    // 2. 彻底修复：支持换行符、中英文逗号、分号等多格式黑名单切分
     const blacklistRegexes = blacklistKeywordsRaw
-        .split(',') 
+        .split(/[\n,，;；]/) 
         .map(k => k.trim()) 
         .filter(k => k.length > 0) 
         .map(wildcardToRegex) 
@@ -29,78 +29,68 @@ export async function handleSubscription(request, env, subToken) {
         
     let urls = [];
     try {
-        // 提取有效的 HTTP 链接
+        // 提取有效 HTTP/HTTPS 链接并过滤注释行
         urls = subListUrls.split('\n')
-                         .map(line => line.trim())
-                         .filter(line => line.startsWith('http://') || line.startsWith('https://')); 
+            .map(line => line.trim())
+            .filter(line => line && !line.startsWith('#') && (line.startsWith('http://') || line.startsWith('https://'))); 
     } catch (e) {
-        console.log('Invalid SUB_LIST_URLS in KV, returning empty list.');
         urls = [];
     }
 
-    // 如果没有配置订阅源，返回空内容
+    // 如果未配置任何订阅源，直接返回空 Base64 内容
     if (urls.length === 0) {
-         return new Response(btoa(""), { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+        return new Response(safeBase64Encode(""), { 
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' } 
+        });
     }
 
     /**
-     * 获取并处理单个 URL 的数据
+     * 单个订阅源拉取与节点侦测任务
      */
-    async function fetchData(url, uniqueStrings) {
+    async function fetchData(url, targetSet) {
         try {
             const response = await fetchWithRetry(url);
             const data = await response.text();
-            if (!data.trim()) {
-                console.log(`Empty response for ${url}`);
+            if (!data || !data.trim()) {
                 return;
             }
-            // 调用侦测模块解析节点
-            detectAndProcess(data, uniqueStrings);
+            // 调用侦测模块解析节点 (兼容 Clash/Xray/Singbox/Base64/裸协议)
+            detectAndProcess(data, targetSet);
         } catch (error) {
-            console.log(`Error processing ${url}: ${error.message}`);
+            // 单个订阅源失败静默放行，避免阻断其余订阅源
         }
     }
 
-    // 并行处理所有站点以提高速度
-    const promises = urls.map(url => fetchData(url, uniqueStrings));
-    await Promise.all(promises);
+    // 3. 使用 Promise.allSettled 替代 Promise.all，确保上游个别节点故障不影响全局拉取
+    const tasks = urls.map(url => fetchData(url, uniqueStrings));
+    await Promise.allSettled(tasks);
 
-    // 应用黑名单过滤逻辑
+    // 4. 应用黑名单过滤逻辑
     let finalNodes;
     if (blacklistRegexes.length > 0) {
         finalNodes = Array.from(uniqueStrings).filter(node => 
-            !isBlacklisted(node, blacklistRegexes) 
+            node && !isBlacklisted(node, blacklistRegexes) 
         );
     } else {
-        finalNodes = Array.from(uniqueStrings);
+        finalNodes = Array.from(uniqueStrings).filter(Boolean);
     }
 
-    // 合并节点内容
+    // 5. 合并节点内容并采用统一加固的高性能 UTF-8 Base64 编码
     const mergedContent = finalNodes.join("\n");
-    const encoder = new TextEncoder();
-    const buffer = encoder.encode(mergedContent);
     
-    let binaryStr = '';
     try {
-        // 分块处理，防止超大数据导致堆栈溢出
-        if (buffer.length > CHUNK_SIZE) {
-            for (let i = 0; i < buffer.length; i += CHUNK_SIZE) {
-                binaryStr += String.fromCharCode.apply(null, buffer.subarray(i, i + CHUNK_SIZE));
-            }
-        } else {
-            binaryStr = String.fromCharCode.apply(null, buffer);
-        }
-        
-        const base64Str = btoa(binaryStr);
+        const base64Str = safeBase64Encode(mergedContent);
         return new Response(base64Str, {
-            headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+            status: 200,
+            headers: { 
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': 'no-store'
+            }
         });
-
     } catch (e) {
-         console.log(`Error encoding base64: ${e.message}`);
-         return new Response(btoa(""), { 
-             status: 500, 
-             headers: { 'Content-Type': 'text/plain; charset=utf-8' } 
-         });
+        return new Response(safeBase64Encode(""), { 
+            status: 500, 
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' } 
+        });
     }
 }
