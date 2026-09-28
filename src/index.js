@@ -179,15 +179,12 @@ function clearAllCaches(ctx, origin = null) {
 }
 
 /**
- * 原生全流反向代理执行器（带错误捕获与状态监控版）
+ * 原生全流反向代理执行器
  */
 async function executeProxy(targetUrl, originalRequest, isWs, clientIP, currentHostname) {
     if (targetUrl.hostname === currentHostname) {
-        console.error(`[Proxy Loop] 目标指向了 Worker 自身: ${targetUrl.hostname}`);
         return new Response("Proxy Loop Detected: Target points to the Worker itself", { status: 508 });
     }
-
-    console.log(`[Proxy Executing] 准备发往上游 -> ${targetUrl.toString()} (WebSocket: ${isWs})`);
 
     const proxyRequest = new Request(targetUrl.toString(), originalRequest);
     
@@ -212,11 +209,8 @@ async function executeProxy(targetUrl, originalRequest, isWs, clientIP, currentH
     }
 
     try {
-        const res = await fetch(proxyRequest, fetchOpts);
-        console.log(`[Proxy Success] 上游响应状态码: ${res.status} ${res.statusText}`);
-        return res;
+        return await fetch(proxyRequest, fetchOpts);
     } catch (err) {
-        console.error(`[Proxy Fetch Error] 请求上游发生致命异常: ${err.message}`);
         return new Response(`Bad Gateway / Upstream Connect Failed: ${err.message}`, {
             status: 502,
             headers: { 'Content-Type': 'text/plain; charset=utf-8' }
@@ -304,8 +298,6 @@ export default {
         const clientIP = request.headers.get('CF-Connecting-IP');
         const isWebSocket = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 
-        console.log(`[Incoming Request] Path: ${url.pathname}, isWS: ${isWebSocket}, Method: ${request.method}`);
-
         // --- 3.1 规则路由匹配 ---
         const routeRulesStr = await getKVCachedL1(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
@@ -354,7 +346,6 @@ export default {
 
             if (matchedRule) {
                 const { key, target } = matchedRule;
-                console.log(`[Rule Matched] 命中规则 Key: "${key}", Target: "${target}"`);
 
                 const protoMatch = target.match(/^(https?):\/\//i);
                 let targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : null;
@@ -413,7 +404,6 @@ export default {
         // --- 3.2 全局兜底反代 ---
         const proxyHost = await getKVCachedL1(request, env, ctx, "PROXY_HOSTNAME");
         if (proxyHost) {
-            console.log(`[Global Proxy] 未命中规则，进入全局反代兜底 -> ${proxyHost}`);
             let targetHostStr = proxyHost.trim();
             const protoMatch = targetHostStr.match(/^(https?):\/\//i);
             let targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : null;
@@ -451,9 +441,7 @@ export default {
             try { return Response.redirect(redirectURL, 302); } catch (e) { }
         }
 
-        // 如果是 WebSocket 握手却未匹配到任何反代目标，绝不能静默返回 204，必须明确报错！
         if (isWebSocket) {
-            console.warn(`[No Route Matched] WebSocket 路径未匹配到任何路由规则: ${url.pathname}`);
             return new Response(`WebSocket Proxy Error: No route rule or global proxy configured for "${url.pathname}"`, {
                 status: 404,
                 headers: { 'Content-Type': 'text/plain; charset=utf-8' }
