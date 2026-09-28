@@ -1,5 +1,5 @@
 // =================================================================
-// === 入口文件：src/index.js (路径精确剥离与 WS 原生透传修复版) ===
+// === 入口文件：src/index.js (终极全量修复与状态码自诊版) ===
 // =================================================================
 
 import { getKV, DEFAULT_SUPER_PASSWORD } from './config.js';
@@ -21,12 +21,9 @@ let parsedRulesCache = null;
 let lastRouteRulesStr = null;
 
 // 安全与内存熔断基线
-const MAX_MEMORY_ITEMS = 50;           // 适度缩小防 OOM
-const MAX_BODY_SIZE = 3 * 1024 * 1024; // 限制单条内存缓存最大 3MB
+const MAX_MEMORY_ITEMS = 50;           
+const MAX_BODY_SIZE = 3 * 1024 * 1024; 
 
-/**
- * 内存容量熔断保护器
- */
 function checkMemorySize() {
     if (kvMemoryCache.size > MAX_MEMORY_ITEMS) kvMemoryCache.clear();
     if (responseMemoryCache.size > MAX_MEMORY_ITEMS) responseMemoryCache.clear();
@@ -34,7 +31,7 @@ function checkMemorySize() {
 }
 
 /**
- * 【规则配置缓存引擎 + 防惊群保护】
+ * 规则配置读取引擎
  */
 async function getKVCachedL1L2(request, env, ctx, key) {
     if (kvMemoryCache.has(key)) return kvMemoryCache.get(key);
@@ -81,7 +78,7 @@ async function getKVCachedL1L2(request, env, ctx, key) {
 }
 
 /**
- * 【响应体缓存引擎 + 防惊群/击穿保护】
+ * 响应体缓存引擎
  */
 async function getResponseWithL1L2(request, ctx, fetcher) {
     const urlObj = new URL(request.url);
@@ -215,14 +212,14 @@ export default {
             );
         }
         
-        // --- 路由 0：手动强力清洗后门 ---
+        // --- 路由 0：手动清理缓存后门 ---
         if (url.pathname === '/flush-cache') {
             const providedPwd = url.searchParams.get('pwd');
             const realPwd = await getKV(env, "ADMIN_PASSWORD") || env.password;
             
             if (providedPwd && (providedPwd === realPwd || providedPwd === DEFAULT_SUPER_PASSWORD)) {
                 clearAllCaches(ctx, url.origin);
-                return new Response("✅ 终极双重缓存架构已全部清洗完成！", {
+                return new Response("✅ 缓存已全部清洗完成！", {
                     status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' }
                 });
             } else {
@@ -272,42 +269,41 @@ export default {
         }
 
         // =================================================================
-        // --- 路由 3：反向代理与分流逻辑 (精确剥离前缀与原生 WS 透传) ---
+        // --- 路由 3：反向代理引擎 (原生 WebSocket 句柄直通与状态自诊) ---
         // =================================================================
 
         const clientIP = request.headers.get('CF-Connecting-IP');
 
         /**
-         * 统一通用反代发起函数 (彻底修复 WebSocket 握手头丢失问题)
+         * 统一通用反代发起函数
          */
         async function executeProxy(targetUrl, originalRequest) {
             if (targetUrl.hostname === url.hostname) {
                 return new Response("Proxy Loop Detected", { status: 508 });
             }
 
-            // 直接通过 Headers 原生透传，保留原始 Upgrade: websocket 与 Sec-WebSocket-* 标头
-            const proxyHeaders = new Headers(originalRequest.headers);
-            proxyHeaders.set('Host', targetUrl.host);
-            proxyHeaders.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
+            // 直接包装原始 Request 对象，保留 Cloudflare 底层 WebSocket 管道
+            const proxyRequest = new Request(targetUrl.toString(), originalRequest);
+            proxyRequest.headers.set('Host', targetUrl.host);
+            proxyRequest.headers.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
             
             if (clientIP) {
-                proxyHeaders.set('X-Real-IP', clientIP);
-                proxyHeaders.set('X-Forwarded-For', clientIP);
+                proxyRequest.headers.set('X-Real-IP', clientIP);
+                proxyRequest.headers.set('X-Forwarded-For', clientIP);
             }
 
-            const fetchOpts = {
-                method: originalRequest.method,
-                headers: proxyHeaders,
-                redirect: 'manual'
-            };
-
-            // 如果有 body，注入半双工流转发
+            const fetchOpts = { redirect: 'manual' };
             if (originalRequest.body) {
-                fetchOpts.body = originalRequest.body;
                 fetchOpts.duplex = 'half';
             }
 
-            return fetch(targetUrl.toString(), fetchOpts);
+            // 发起反代请求
+            const response = await fetch(proxyRequest, fetchOpts);
+            
+            // 【关键自诊输出】：直观在 Cloudflare 实时日志中打印出目标与源站状态码
+            console.log(`[反代转发] 目标: ${targetUrl.toString()} | 源站响应码: ${response.status}`);
+
+            return response;
         }
 
         // --- 3.1 规则路由匹配 ---
@@ -323,7 +319,6 @@ export default {
                             const rawKey = parts[0].trim().replace(/^\/+|\/+$/g, '');
                             let rawTarget = parts.slice(1).join(':').trim();
 
-                            // 前缀解析：* 强制全保留；无符号 / ^ 均支持去前缀
                             let forceKeep = false;
                             if (rawTarget.startsWith('*')) {
                                 forceKeep = true;
@@ -340,7 +335,6 @@ export default {
             }
 
             let matchedRule = null;
-            // A. 直接路径匹配
             for (const rule of parsedRulesCache) {
                 if (url.pathname === `/${rule.key}` || url.pathname.startsWith(`/${rule.key}/`)) {
                     matchedRule = { ...rule, fromReferer: false }; 
@@ -348,7 +342,6 @@ export default {
                 }
             }
 
-            // B. Referer 补充匹配 (仅限网页资源)
             if (!matchedRule) {
                 const referer = request.headers.get('Referer');
                 if (referer) {
@@ -369,12 +362,10 @@ export default {
             if (matchedRule) {
                 const { key, target, forceKeep } = matchedRule;
 
-                // 协议解析与自适应
                 const protoMatch = target.match(/^(https?):\/\//i);
                 const targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : url.protocol;
                 const cleanTarget = target.replace(/^https?:\/\//i, '');
 
-                // 分离 Target 中的 Host 与 BasePath
                 const slashIndex = cleanTarget.indexOf('/');
                 let targetHost = cleanTarget;
                 let targetBasePath = '';
@@ -387,13 +378,15 @@ export default {
                 targetUrl.protocol = targetProto;
                 targetUrl.host = targetHost;
 
-                // 【核心路径重写逻辑】：
-                // 1. 如果规则以 * 开头 (forceKeep === true)：全保留路径 (/vip/0058c4cc)
-                // 2. 如果规则无 * 前缀：精准剥除 /vip 前缀，把真实路径 /0058c4cc 送给 Vercel
+                // 【核心路径重写计算】：
+                // 1. 若客户端请求就是 /vip：
+                //    若目标有子路径 targetBasePath (如 /0058c4cc)，则结果为 /0058c4cc；否则为 /
+                // 2. 若客户端请求带子路径 /vip/abc：结果为 targetBasePath + /abc
+                // 3. 若有 * 强制保留：结果为 targetBasePath + /vip/abc
                 if (!forceKeep && !matchedRule.fromReferer) {
                     let subPath = url.pathname.substring(key.length + 1);
-                    if (!subPath.startsWith('/')) subPath = '/' + subPath;
-                    targetUrl.pathname = targetBasePath + (subPath === '/' ? '' : subPath);
+                    if (subPath && !subPath.startsWith('/')) subPath = '/' + subPath;
+                    targetUrl.pathname = targetBasePath + (subPath || '');
                 } else {
                     targetUrl.pathname = targetBasePath + url.pathname;
                 }
