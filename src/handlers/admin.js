@@ -14,34 +14,42 @@ export async function handleAdmin(request, env, configPassword, subToken) {
     if (request.method === "POST") {
         try {
             const formData = await request.formData();
-            const newPassword = formData.get('password');
-            const newRouteRules = formData.get('route_rules');
-            const newHostname = formData.get('hostname');
-            const newSubListUrls = formData.get('sublist_urls'); 
-            const newSubBlacklist = formData.get('sub_blacklist');
-            const newExpiryDays = formData.get('sub_expiry_days');
-            const newRedirectURL = formData.get('root_redirect_url');
+            
+            // 1. 严格清洗密码：去除首尾不可见字符，防止管理员被锁在门外
+            const rawPassword = formData.get('password') || '';
+            const newPassword = rawPassword.trim();
+            
+            const newRouteRules = (formData.get('route_rules') || '').trim();
+            const newHostname = (formData.get('hostname') || '').trim();
+            const newSubListUrls = (formData.get('sublist_urls') || '').trim(); 
+            const newSubBlacklist = (formData.get('sub_blacklist') || '').trim();
+            
+            // 2. 防御性校验天数：强制转换为非负整数，杜绝 NaN 污染 Token
+            const parsedDays = parseInt(formData.get('sub_expiry_days') || '0', 10);
+            const newExpiryDays = (isNaN(parsedDays) || parsedDays < 0) ? '0' : String(parsedDays);
+            
+            const newRedirectURL = (formData.get('root_redirect_url') || '').trim();
 
             if (!newPassword) {
-                return new Response(JSON.stringify({ success: false, message: '密码不能为空！' }), {
+                return new Response(JSON.stringify({ success: false, message: '管理密码不能为空！' }), {
                     status: 400, headers: { 'Content-Type': 'application/json; charset=utf-8' }
                 });
             }
 
-            // 【性能优化】并发写入 KV，降低 80% 延迟
+            // 【性能优化】并发原子写入 KV
             await Promise.all([
                 putKV(env, "ADMIN_PASSWORD", newPassword),
-                putKV(env, "ROUTE_RULES", newRouteRules || ""),
-                putKV(env, "PROXY_HOSTNAME", newHostname || ""),
-                putKV(env, "SUB_LIST_URLS", newSubListUrls || ""),
-                putKV(env, "SUB_BLACKLIST", newSubBlacklist || ""),
-                putKV(env, "SUB_EXPIRY_DAYS", newExpiryDays || "0"),
-                putKV(env, "ROOT_REDIRECT_URL", newRedirectURL || "")
+                putKV(env, "ROUTE_RULES", newRouteRules),
+                putKV(env, "PROXY_HOSTNAME", newHostname),
+                putKV(env, "SUB_LIST_URLS", newSubListUrls),
+                putKV(env, "SUB_BLACKLIST", newSubBlacklist),
+                putKV(env, "SUB_EXPIRY_DAYS", newExpiryDays),
+                putKV(env, "ROOT_REDIRECT_URL", newRedirectURL)
             ]);
             
             return new Response(JSON.stringify({ 
                 success: true, 
-                message: '保存成功！缓存已重置，页面将在3秒后更新跳转。' 
+                message: '保存成功！缓存已重置，页面将在 2 秒后自动跳转。' 
             }), {
                 headers: { 'Content-Type': 'application/json; charset=utf-8' }
             });
@@ -53,7 +61,7 @@ export async function handleAdmin(request, env, configPassword, subToken) {
         }
     }
 
-    // GET: 输出页面
+    // GET: 获取并渲染后台配置页面
     const [routeRules, proxyHost, subListUrls, subBlacklist, subExpiryDays, rootRedirectURL] = await Promise.all([
         getKV(env, "ROUTE_RULES"),
         getKV(env, "PROXY_HOSTNAME"),
@@ -118,16 +126,16 @@ export async function handleAdmin(request, env, configPassword, subToken) {
                 <input type="password" id="password" name="password" value="${escapeHTML(passwordForHtml)}" required>
             </div>
             <div class="input-group">
-                <label>订阅自动过期天数</label>
+                <label>订阅自动过期天数 (0 为禁用)</label>
                 <input type="number" name="sub_expiry_days" value="${escapeHTML(subExpiryDays || '0')}" min="0">
             </div>
             <div class="input-group">
                 <label>路由规则 (ROUTE_RULES)</label>
                 <textarea name="route_rules">${escapeHTML(routeRules || '')}</textarea>
                 <small>
-                    • <b>无符号</b>（去前缀）：<code>google: google.com</code><br>
-                    • <b>*</b>（全保留）：<code>vps: *vps.com:8443</code><br>
-                    • <b>^</b>（智能分流）：WS 保留路径，HTTP 网页去除前缀
+                    • <b>无符号</b>（只反代网页）：去前缀，忽略节点流量<br>
+                    • <b>*</b>（只反代节点）：全保留路径，兼容 WS / XHTTP 节点<br>
+                    • <b>^</b>（智能分流）：节点保留全路径，网页自动去除前缀
                 </small>
             </div>
             <div class="input-group">
@@ -139,11 +147,11 @@ export async function handleAdmin(request, env, configPassword, subToken) {
                 <input type="text" name="root_redirect_url" value="${escapeHTML(rootRedirectURL || '')}">
             </div>
             <div class="input-group">
-                <label>订阅 URL 列表</label>
+                <label>订阅 URL 列表 (支持多行或以 # 注释)</label>
                 <textarea name="sublist_urls">${escapeHTML(subListUrls || '')}</textarea>
             </div>
             <div class="input-group">
-                <label>节点黑名单</label>
+                <label>节点黑名单 (支持换行、中英文逗号分隔)</label>
                 <textarea name="sub_blacklist">${escapeHTML(subBlacklist || '')}</textarea>
             </div>
             <div class="input-group">
@@ -162,7 +170,12 @@ export async function handleAdmin(request, env, configPassword, subToken) {
         document.getElementById('config-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             const status = document.getElementById('status');
-            const pass = document.getElementById('password').value;
+            const pass = document.getElementById('password').value.trim();
+            if (!pass) {
+                status.className = 'status-error';
+                status.textContent = '密码不能为空！';
+                return;
+            }
             status.textContent = '保存中...';
             try {
                 const res = await fetch(window.location.pathname, { method: 'POST', body: new FormData(this) });
@@ -170,18 +183,18 @@ export async function handleAdmin(request, env, configPassword, subToken) {
                 if (json.success) {
                     status.className = 'status-success';
                     status.textContent = json.message;
-                    const newPath = '/' + pass;
-                    // 如果通过超级密码后门访问，或者路径未变，直接刷新
-                    if (window.location.pathname !== newPath && window.location.pathname !== '/${DEFAULT_SUPER_PASSWORD}') {
-                        setTimeout(() => location.href = newPath, 2000);
-                    } else {
-                        setTimeout(() => location.reload(), 2000);
-                    }
+                    const targetPath = '/' + encodeURIComponent(pass);
+                    setTimeout(() => {
+                        window.location.href = targetPath;
+                    }, 2000);
                 } else {
                     status.className = 'status-error';
                     status.textContent = json.message;
                 }
-            } catch (err) { status.textContent = '错误: ' + err.message; }
+            } catch (err) { 
+                status.className = 'status-error';
+                status.textContent = '网络错误: ' + err.message; 
+            }
         });
 
         document.getElementById('copy-btn').onclick = function() {
@@ -191,10 +204,14 @@ export async function handleAdmin(request, env, configPassword, subToken) {
         };
 
         document.getElementById('flush-cache-btn').addEventListener('click', async function() {
-            const pass = document.getElementById('password').value;
-            if (!confirm('确定要清理系统缓存吗？')) return;
+            const pass = document.getElementById('password').value.trim();
+            if (!pass) {
+                alert('请先输入管理密码！');
+                return;
+            }
+            if (!confirm('确定要清理系统全部双重缓存吗？')) return;
             const status = document.getElementById('status');
-            status.textContent = '清理中...';
+            status.textContent = '正在清理缓存...';
             try {
                 const res = await fetch('/flush-cache?pwd=' + encodeURIComponent(pass));
                 const text = await res.text();
