@@ -1,5 +1,5 @@
 // =================================================================
-// === 入口文件：src/index.js (纯净 WS 代理与故障内容透视版) ===
+// === 入口文件：src/index.js (官方标准 WS 双向隧道缝合版) ===
 // =================================================================
 
 import { getKV, DEFAULT_SUPER_PASSWORD } from './config.js';
@@ -253,56 +253,42 @@ export default {
         }
 
         // =================================================================
-        // --- 路由 3：反向代理引擎 (纯净 WS 直通与错误自诊断) ---
+        // --- 路由 3：反向代理引擎 (标准双向 WS 管道与流转发) ---
         // =================================================================
 
         const clientIP = request.headers.get('CF-Connecting-IP');
         const isWebSocket = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 
+        /**
+         * 统一通用反代发起函数
+         */
         async function executeProxy(targetUrl, originalRequest) {
             if (targetUrl.hostname === url.hostname) {
                 return new Response("Proxy Loop Detected", { status: 508 });
             }
 
-            // 1. 复制标头并修正 Host
-            const proxyHeaders = new Headers(originalRequest.headers);
-            proxyHeaders.set('Host', targetUrl.host);
-            proxyHeaders.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
+            // 【关键技术点】：直接基于 originalRequest 构造 proxyRequest
+            // Cloudflare 运行时检测到原始 Request 包含 WS 会话时，会原生挂接双向 WebSocket 管道！
+            const proxyRequest = new Request(targetUrl.toString(), originalRequest);
+            proxyRequest.headers.set('Host', targetUrl.host);
+            proxyRequest.headers.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
             
             if (clientIP) {
-                proxyHeaders.set('X-Real-IP', clientIP);
-                proxyHeaders.set('X-Forwarded-For', clientIP);
+                proxyRequest.headers.set('X-Real-IP', clientIP);
+                proxyRequest.headers.set('X-Forwarded-For', clientIP);
             }
 
-            // 2. 针对 WebSocket 的纯净代理配置 (去除任何干扰 WS 握手的非标准选项)
-            let response;
+            // 针对 WebSocket 代理，直接返回原生 fetch，绝对不传 options 干扰管道缝合
             if (isWebSocket) {
-                response = await fetch(targetUrl.toString(), {
-                    method: 'GET',
-                    headers: proxyHeaders
-                });
-            } else {
-                const fetchOpts = {
-                    method: originalRequest.method,
-                    headers: proxyHeaders,
-                    redirect: 'manual'
-                };
-                if (originalRequest.body) {
-                    fetchOpts.body = originalRequest.body;
-                    fetchOpts.duplex = 'half';
-                }
-                response = await fetch(targetUrl.toString(), fetchOpts);
+                return fetch(proxyRequest);
             }
 
-            // 【故障深度透视】：打印目标地址、真实响应状态码与前 200 字节内容
-            if (response.status === 101) {
-                console.log(`[握手成功 ✅] 目标: ${targetUrl.toString()} -> 101 Switching Protocols`);
-            } else {
-                const peekText = await response.clone().text().catch(() => '');
-                console.log(`[握手异常 ❌] 目标: ${targetUrl.toString()} | 源站状态码: ${response.status} | 内容: ${peekText.slice(0, 150).replace(/\s+/g, ' ')}`);
+            // 普通 HTTP / POST 请求
+            const fetchOpts = { redirect: 'manual' };
+            if (originalRequest.body) {
+                fetchOpts.duplex = 'half';
             }
-
-            return response;
+            return fetch(proxyRequest, fetchOpts);
         }
 
         // --- 3.1 规则路由匹配 ---
@@ -377,7 +363,6 @@ export default {
                 targetUrl.protocol = targetProto;
                 targetUrl.host = targetHost;
 
-                // 路径拼接与去前缀
                 if (!forceKeep && !matchedRule.fromReferer) {
                     let subPath = url.pathname.substring(key.length + 1);
                     if (subPath && !subPath.startsWith('/')) subPath = '/' + subPath;
