@@ -1,17 +1,15 @@
 /**
  * cleaner.js
- * 移植自 Cleaner.c (JS Cleaner V8)
+ * 核心重构版：安全擦除注释与日志 (Neutralized Hijacking)
  * 功能：
- * 1. 自动识别并彻底删除“整行注释”，不留空行
- * 2. 修复 Unexpected token, 保护 https://, 智能处理 console
- * 3. 自动清理注释前的缩进空格
- * 4. 优化：修复 \r\n 换行符在注释清理过程中可能丢失的问题，保持编码一致性
- * 5. [Fix] 增强正则判断逻辑，支持更多操作符
+ * 1. 彻底移除单行/多行注释，保留换行符防止 ASI 语法崩溃
+ * 2. 精准识别 console.log/warn/error/info/debug，修复前导字符误判
+ * 3. 将 console.xxx(...) 安全替换为 void Array(...)，保留表达式副作用与合法语法
+ * 4. 完善正则表达式字面量解析（支持字符类 [...] 内斜杠识别）
  */
 
 const fs = require('fs');
 
-// 定义状态常量
 const STATE = {
     CODE: 0,
     STRING_SQ: 1,    // '...'
@@ -22,40 +20,39 @@ const STATE = {
     COMMENT_BLOCK: 6 // /*...*/
 };
 
-// 辅助函数：判断字符是否为空白
 function isSpace(char) {
     return /\s/.test(char);
 }
 
-// 辅助函数：判断字符是否为字母数字或 _$
 function isAlnum(char) {
     return /[a-zA-Z0-9_$]/.test(char);
 }
 
-// 判断 / 是否为正则开头
 function isRegexStart(text, idx) {
     let i = idx - 1;
     while (i >= 0 && isSpace(text[i])) i--;
     if (i < 0) return true;
     const last = text[i];
-    // [修复] 增加 [, *, +, -, %, ^, &, |, <, > 等操作符，防止误判
     if ("(=,:!&|?{};,[]*+-%<>^~".includes(last)) return true;
     
     if (isAlnum(last) || last === ')') {
         let end = i;
         while (i >= 0 && isAlnum(text[i])) i--;
         const word = text.substring(i + 1, end + 1);
-        
         const keywords = ["return", "case", "throw", "delete", "void", "typeof", "await", "yield"];
         if (keywords.includes(word)) return true;
-        
         return false;
     }
     return false;
 }
 
-// 检查 console 类型
 function checkConsoleType(text, i, size) {
+    // 检查前导字符：若紧跟字母、数字、_、$ 或点号 .，说明非独立 console 对象（如 myconsole 或 obj.console）
+    if (i > 0) {
+        const prev = text[i - 1];
+        if (isAlnum(prev) || prev === '.') return { type: 0, len: 0 };
+    }
+
     if (text.substring(i, i + 8) !== "console.") return { type: 0, len: 0 };
     
     const methods = ["log", "warn", "error", "info", "debug"];
@@ -87,55 +84,24 @@ function processCode(input) {
     const output = []; 
     let state = STATE.CODE;
     let i = 0;
-    
-    let skipMode = false;
-    let parenDepth = 0;
-    let inArgStr = 0; // 0=none, 1=', 2=", 3=`
-    let isWholeLineComment = false;
+    let inCharClass = false; // 正则表达式内部字符类 [...] 标志
 
     while (i < size) {
         const c = input[i];
         const next = (i + 1 < size) ? input[i + 1] : '';
-
-        // --- Console 参数吞噬模式 ---
-        if (skipMode) {
-            if (inArgStr !== 0) {
-                if (c === '\\') { i++; } 
-                else if ((inArgStr === 1 && c === '\'') ||
-                         (inArgStr === 2 && c === '"') ||
-                         (inArgStr === 3 && c === '`')) {
-                    inArgStr = 0;
-                }
-            } else {
-                if (c === '\'') inArgStr = 1;
-                else if (c === '"') inArgStr = 2;
-                else if (c === '`') inArgStr = 3;
-                else if (c === '(') parenDepth++;
-                else if (c === ')') {
-                    parenDepth--;
-                    if (parenDepth === 0) skipMode = false;
-                }
-            }
-            i++;
-            continue;
-        }
 
         // --- 正常模式 ---
         if (state === STATE.CODE) {
             const { type: cType, len: mLen } = checkConsoleType(input, i, size);
             
             if (cType === 1) { 
-                const rep = "void(0)";
+                // 安全替换 console.xxx 为 void Array，保留后续括号与参数副作用
+                const rep = "void Array";
                 for (const char of rep) output.push(char);
                 i += mLen;
-                while (i < size && isSpace(input[i])) i++;
-                if (input[i] === '(') {
-                    skipMode = true;
-                    parenDepth = 1;
-                    i++;
-                }
-                continue;
+                continue; 
             } else if (cType === 2) { 
+                // 属性引用（如 const fn = console.log）替换为空函数
                 const rep = "(()=>{})";
                 for (const char of rep) output.push(char);
                 i += mLen;
@@ -147,33 +113,16 @@ function processCode(input) {
             else if (c === '`') { state = STATE.STRING_TMP; output.push(c); }
             else if (c === '/') {
                 if (next === '/') {
-                    let tempIdx = output.length;
-                    let onlySpaces = true;
-                    
-                    while (tempIdx > 0) {
-                        const prev = output[tempIdx - 1];
-                        if (prev === '\n' || prev === '\r') break; 
-                        if (prev !== ' ' && prev !== '\t') {
-                            onlySpaces = false;
-                            break;
-                        }
-                        tempIdx--;
-                    }
-
-                    if (onlySpaces) {
-                        output.length = tempIdx;
-                        isWholeLineComment = true;
-                    } else {
-                        isWholeLineComment = false;
-                    }
-
                     state = STATE.COMMENT_LINE;
                     i++; 
                 } else if (next === '*') {
                     state = STATE.COMMENT_BLOCK;
                     i++; 
                 } else {
-                    if (isRegexStart(input, i)) state = STATE.REGEX;
+                    if (isRegexStart(input, i)) {
+                        state = STATE.REGEX;
+                        inCharClass = false;
+                    }
                     output.push(c);
                 }
             } else {
@@ -197,22 +146,26 @@ function processCode(input) {
         }
         else if (state === STATE.REGEX) {
             output.push(c);
-            if (c === '\\') { if (next) { output.push(next); i++; } }
-            else if (c === '/') state = STATE.CODE;
-            else if (c === '\n') state = STATE.CODE; 
+            if (c === '\\') { 
+                if (next) { output.push(next); i++; } 
+            } else if (c === '[') {
+                inCharClass = true;
+            } else if (c === ']') {
+                inCharClass = false;
+            } else if (c === '/' && !inCharClass) {
+                state = STATE.CODE;
+            } else if (c === '\n') {
+                state = STATE.CODE;
+                inCharClass = false;
+            }
         }
-        // --- 注释处理 (修复 \r 丢失) ---
         else if (state === STATE.COMMENT_LINE) {
             if (c === '\n') {
-                if (!isWholeLineComment) {
-                    // 如果前一个字符是 \r，说明是 Windows 风格换行，需保留 \r
-                    if (i > 0 && input[i - 1] === '\r') {
-                        output.push('\r');
-                    }
-                    output.push(c); 
+                if (i > 0 && input[i - 1] === '\r') {
+                    output.push('\r');
                 }
+                output.push(c); // 保留换行符，确保 ASI 与行号结构不受破坏
                 state = STATE.CODE;
-                isWholeLineComment = false;
             }
         }
         else if (state === STATE.COMMENT_BLOCK) {
@@ -221,7 +174,6 @@ function processCode(input) {
                 output.push(' '); 
                 i++;
             } else if (c === '\n') {
-                // 块注释内部换行同样需要检查并保留 \r
                 if (i > 0 && input[i - 1] === '\r') {
                     output.push('\r');
                 }
@@ -244,7 +196,7 @@ function cleanFile(filePath) {
         const content = fs.readFileSync(filePath, 'utf8');
         const cleaned = processCode(content);
         fs.writeFileSync(filePath, cleaned, 'utf8');
-        console.log(`[Cleaner] Done. Removed comments and consoles.`);
+        console.log(`[Cleaner] Done. Refactored consoles and removed comments.`);
     } catch (e) {
         console.error(`[Cleaner] Error: ${e.message}`);
     }
