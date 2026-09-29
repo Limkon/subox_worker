@@ -16,7 +16,7 @@ const knownCacheKeys = new Set();      // 记录已写入 L2 缓存的 URL
 const inFlightKVPromises = new Map();       // 合并并发读取相同 KV 的请求
 const inFlightResponsePromises = new Map(); // 合并并发拉取相同订阅的请求
 
-// --- 路由规则解析缓存 (CPU 优化) ---
+// --- 路由规则解析缓存 (CPU 优化：预编译 Target 地址) ---
 let parsedRulesCache = null;
 let lastRouteRulesStr = null;
 
@@ -25,12 +25,68 @@ const MAX_MEMORY_ITEMS = 50;           // 适度缩小防 OOM
 const MAX_BODY_SIZE = 3 * 1024 * 1024; // 限制单条内存缓存最大 3MB
 
 /**
- * 内存容量熔断保护器
+ * 平滑安全的内存容量控制器 (杜绝全量 clear 导致的瞬间惊群击穿)
  */
-function checkMemorySize() {
-    if (kvMemoryCache.size > MAX_MEMORY_ITEMS) kvMemoryCache.clear();
-    if (responseMemoryCache.size > MAX_MEMORY_ITEMS) responseMemoryCache.clear();
-    if (knownCacheKeys.size > MAX_MEMORY_ITEMS * 2) knownCacheKeys.clear();
+function safeSetCache(map, key, value, limit = MAX_MEMORY_ITEMS) {
+    if (map.size >= limit) {
+        // 每次修剪最旧的 10% 键，保持缓存温热平滑过渡
+        const evictCount = Math.max(1, Math.floor(limit * 0.1));
+        const iterator = map.keys();
+        for (let i = 0; i < evictCount; i++) {
+            const oldestKey = iterator.next().value;
+            if (oldestKey !== undefined) map.delete(oldestKey);
+        }
+    }
+    map.set(key, value);
+}
+
+/**
+ * 预编译解析路由规则 (将 URL 拆解下沉到配置更新时执行，请求热路径 0 正则)
+ */
+function parseRouteRules(routeRulesStr) {
+    if (!routeRulesStr) return [];
+    return routeRulesStr.split('\n')
+        .map(l => l.trim())
+        .filter(l => l && !l.startsWith('#'))
+        .map(rule => {
+            const colonIdx = rule.indexOf(':');
+            if (colonIdx === -1) return null;
+            const rawKey = rule.slice(0, colonIdx).trim().replace(/^\/+|\/+$/g, '');
+            const rawTarget = rule.slice(colonIdx + 1).trim();
+            if (!rawKey || !rawTarget) return null;
+
+            // 预解析协议与 Host / Path
+            const protoMatch = rawTarget.match(/^(https?):\/\//i);
+            let targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : null;
+            const cleanTarget = rawTarget.replace(/^https?:\/\//i, '');
+            const slashIndex = cleanTarget.indexOf('/');
+
+            let targetHost = '';
+            let targetBasePath = '';
+            if (slashIndex !== -1) {
+                targetHost = cleanTarget.substring(0, slashIndex).trim();
+                targetBasePath = cleanTarget.substring(slashIndex).replace(/\/+$/, '');
+            } else {
+                targetHost = cleanTarget.trim();
+            }
+
+            if (!targetProto) {
+                const portMatch = targetHost.match(/:(\d+)$/);
+                if (portMatch && (portMatch[1] === '80' || portMatch[1] === '8080')) {
+                    targetProto = 'http:';
+                } else {
+                    targetProto = 'https:';
+                }
+            }
+
+            return {
+                key: rawKey,
+                targetProto,
+                targetHost,
+                targetBasePath,
+                originalTarget: rawTarget
+            };
+        }).filter(Boolean);
 }
 
 /**
@@ -46,8 +102,7 @@ async function getKVCachedL1(request, env, ctx, key) {
     const kvFetchTask = (async () => {
         try {
             const val = (await getKV(env, key)) || "";
-            checkMemorySize();
-            kvMemoryCache.set(key, val);
+            safeSetCache(kvMemoryCache, key, val);
             return val;
         } finally {
             inFlightKVPromises.delete(key);
@@ -66,6 +121,7 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
     const cleanUrlStr = urlObj.origin + urlObj.pathname;
     const cacheReq = new Request(cleanUrlStr, { method: 'GET' });
 
+    // 1. 命中 L1 内存缓存
     if (responseMemoryCache.has(cleanUrlStr)) {
         const cached = responseMemoryCache.get(cleanUrlStr);
         return new Response(cached.body.slice(0), {
@@ -74,6 +130,7 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
         });
     }
 
+    // 2. 命中并发合并任务 (Single-Flight)
     if (inFlightResponsePromises.has(cleanUrlStr)) {
         const sharedData = await inFlightResponsePromises.get(cleanUrlStr);
         return new Response(sharedData.body.slice(0), {
@@ -84,6 +141,7 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
 
     const singleFlightTask = (async () => {
         try {
+            // 3. 检查 L2 边缘缓存
             const edgeCache = caches.default;
             const l2Response = await edgeCache.match(cacheReq);
             if (l2Response) {
@@ -94,13 +152,13 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
                     headers: Array.from(l2Response.headers.entries())
                 };
                 if (bodyBuf.byteLength <= MAX_BODY_SIZE) {
-                    checkMemorySize();
-                    responseMemoryCache.set(cleanUrlStr, cacheItem);
+                    safeSetCache(responseMemoryCache, cleanUrlStr, cacheItem);
                 }
                 knownCacheKeys.add(cleanUrlStr);
                 return cacheItem;
             }
 
+            // 4. 回源生成订阅响应
             const response = await fetcher();
 
             if (!response || response.status !== 200) {
@@ -120,13 +178,14 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
             };
 
             if (bodyBuf.byteLength <= MAX_BODY_SIZE) {
-                checkMemorySize();
-                responseMemoryCache.set(cleanUrlStr, cacheItem);
+                safeSetCache(responseMemoryCache, cleanUrlStr, cacheItem);
             }
 
+            // 修复边缘缓存一年假死问题：设定合理的 s-maxage，兼顾防击穿与时效
             const l2CacheHeaders = new Headers(response.headers);
-            l2CacheHeaders.set('Cache-Control', 'max-age=31536000');
+            l2CacheHeaders.set('Cache-Control', 'public, max-age=60, s-maxage=1800');
             l2CacheHeaders.delete('Set-Cookie');
+
             const cacheResponse = new Response(bodyBuf.slice(0), {
                 status: response.status,
                 headers: l2CacheHeaders
@@ -166,16 +225,6 @@ function clearAllCaches(ctx, origin = null) {
         } catch (e) {}
     }
     knownCacheKeys.clear();
-
-    if (origin) {
-        const internalKvKeys = ["ADMIN_PASSWORD", "SUB_EXPIRY_DAYS", "ROUTE_RULES", "PROXY_HOSTNAME", "ROOT_REDIRECT_URL", "SUB_LIST_URLS", "SUB_BLACKLIST"];
-        for (const kvKey of internalKvKeys) {
-            const dummyUrlStr = `${origin}/__internal_kv_cache/${kvKey}`;
-            try {
-                ctx.waitUntil(edgeCache.delete(new Request(dummyUrlStr, { method: 'GET' })));
-            } catch (e) {}
-        }
-    }
 }
 
 /**
@@ -186,30 +235,37 @@ async function executeProxy(targetUrl, originalRequest, isWs, clientIP, currentH
         return new Response("Proxy Loop Detected: Target points to the Worker itself", { status: 508 });
     }
 
-    const proxyRequest = new Request(targetUrl.toString(), originalRequest);
-    
-    proxyRequest.headers.set('Host', targetUrl.host);
-    proxyRequest.headers.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
+    const newHeaders = new Headers(originalRequest.headers);
+    newHeaders.set('Host', targetUrl.host);
+    newHeaders.set('X-Forwarded-Proto', targetUrl.protocol.replace(':', ''));
     
     if (clientIP) {
-        proxyRequest.headers.set('X-Real-IP', clientIP);
+        newHeaders.set('X-Real-IP', clientIP);
         const existingXFF = originalRequest.headers.get('X-Forwarded-For');
-        proxyRequest.headers.set('X-Forwarded-For', existingXFF ? `${existingXFF}, ${clientIP}` : clientIP);
+        newHeaders.set('X-Forwarded-For', existingXFF ? `${existingXFF}, ${clientIP}` : clientIP);
     }
 
     if (isWs) {
-        proxyRequest.headers.set('Upgrade', 'websocket');
-        proxyRequest.headers.set('Connection', 'Upgrade');
+        newHeaders.set('Upgrade', 'websocket');
+        newHeaders.set('Connection', 'Upgrade');
+    } else {
+        newHeaders.delete('keep-alive');
     }
 
-    const fetchOpts = { redirect: 'manual' };
+    const fetchOpts = {
+        method: originalRequest.method,
+        headers: newHeaders,
+        redirect: 'manual'
+    };
+
     const methodUpper = originalRequest.method.toUpperCase();
     if (methodUpper !== 'GET' && methodUpper !== 'HEAD' && originalRequest.body) {
+        fetchOpts.body = originalRequest.body;
         fetchOpts.duplex = 'half';
     }
 
     try {
-        return await fetch(proxyRequest, fetchOpts);
+        return await fetch(targetUrl.toString(), fetchOpts);
     } catch (err) {
         return new Response(`Bad Gateway / Upstream Connect Failed: ${err.message}`, {
             status: 502,
@@ -302,20 +358,7 @@ export default {
         const routeRulesStr = await getKVCachedL1(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
             if (routeRulesStr !== lastRouteRulesStr || !parsedRulesCache) {
-                parsedRulesCache = routeRulesStr.split('\n')
-                    .map(l => l.trim())
-                    .filter(l => l && !l.startsWith('#'))
-                    .map(rule => {
-                        const parts = rule.split(':');
-                        if (parts.length >= 2) {
-                            const rawKey = parts[0].trim().replace(/^\/+|\/+$/g, '');
-                            const rawTarget = parts.slice(1).join(':').trim();
-                            if (rawKey && rawTarget) {
-                                return { key: rawKey, target: rawTarget };
-                            }
-                        }
-                        return null;
-                    }).filter(r => r !== null);
+                parsedRulesCache = parseRouteRules(routeRulesStr);
                 lastRouteRulesStr = routeRulesStr;
             }
 
@@ -345,31 +388,7 @@ export default {
             }
 
             if (matchedRule) {
-                const { key, target } = matchedRule;
-
-                const protoMatch = target.match(/^(https?):\/\//i);
-                let targetProto = protoMatch ? (protoMatch[1].toLowerCase() + ':') : null;
-                const cleanTarget = target.replace(/^https?:\/\//i, '');
-
-                const slashIndex = cleanTarget.indexOf('/');
-                let targetHost = cleanTarget;
-                let targetBasePath = '';
-                if (slashIndex !== -1) {
-                    targetHost = cleanTarget.substring(0, slashIndex).trim();
-                    targetBasePath = cleanTarget.substring(slashIndex).replace(/\/+$/, '');
-                } else {
-                    targetHost = cleanTarget.trim();
-                }
-
-                if (!targetProto) {
-                    const portMatch = targetHost.match(/:(\d+)$/);
-                    if (portMatch && (portMatch[1] === '80' || portMatch[1] === '8080')) {
-                        targetProto = 'http:';
-                    } else {
-                        targetProto = 'https:';
-                    }
-                }
-
+                const { key, targetProto, targetHost, targetBasePath } = matchedRule;
                 const targetUrl = new URL(`${targetProto}//${targetHost}`);
 
                 let subPath = '';
@@ -377,7 +396,8 @@ export default {
                     subPath = url.pathname;
                 } else {
                     if (url.pathname === `/${key}` || url.pathname === `/${key}/`) {
-                        subPath = '/';
+                        // 保护客户端原本可能携带的末尾斜杠
+                        subPath = url.pathname.endsWith('/') ? '/' : '';
                     } else if (url.pathname.startsWith(`/${key}/`)) {
                         subPath = url.pathname.slice(key.length + 1);
                     } else {
@@ -385,14 +405,15 @@ export default {
                     }
                 }
 
-                if (!subPath.startsWith('/')) {
+                if (subPath && !subPath.startsWith('/')) {
                     subPath = '/' + subPath;
                 }
 
+                // 准确组合目标路径，杜绝双斜杠与斜杠丢失引发的 301 重定向循环
                 if (targetBasePath) {
-                    targetUrl.pathname = targetBasePath + (subPath === '/' ? '' : subPath);
+                    targetUrl.pathname = targetBasePath + (subPath === '/' ? '/' : subPath);
                 } else {
-                    targetUrl.pathname = subPath;
+                    targetUrl.pathname = subPath || '/';
                 }
 
                 targetUrl.search = url.search;
@@ -429,7 +450,7 @@ export default {
             }
 
             const targetUrl = new URL(`${targetProto}//${targetHost}`);
-            targetUrl.pathname = targetBasePath + url.pathname;
+            targetUrl.pathname = targetBasePath ? (targetBasePath + (url.pathname.startsWith('/') ? url.pathname : '/' + url.pathname)) : url.pathname;
             targetUrl.search = url.search;
 
             return executeProxy(targetUrl, request, isWebSocket, clientIP, url.hostname);
