@@ -1,5 +1,5 @@
 // =================================================================
-// === 入口文件：src/index.js ===
+// === 入口文件：src/index.js (完整双重 L1+L2 边缘缓存架构) ===
 // =================================================================
 
 import { getKV, DEFAULT_SUPER_PASSWORD } from './config.js';
@@ -24,12 +24,23 @@ let lastRouteRulesStr = null;
 const MAX_MEMORY_ITEMS = 50;           // 适度缩小防 OOM
 const MAX_BODY_SIZE = 3 * 1024 * 1024; // 限制单条内存缓存最大 3MB
 
+// 需要在 L2 边缘缓存中管理的内部 KV 键列表
+const INTERNAL_KV_KEYS = [
+    "ADMIN_PASSWORD",
+    "SUB_EXPIRY_DAYS",
+    "ROUTE_RULES",
+    "PROXY_HOSTNAME",
+    "ROOT_REDIRECT_URL",
+    "SUB_LIST_URLS",
+    "SUB_BLACKLIST"
+];
+
 /**
  * 平滑安全的内存容量控制器 (杜绝全量 clear 导致的瞬间惊群击穿)
  */
 function safeSetCache(map, key, value, limit = MAX_MEMORY_ITEMS) {
     if (map.size >= limit) {
-        // 每次修剪最旧的 10% 键，保持缓存温热平滑过渡
+        // 每次平滑修剪最旧的 10% 键，保持缓存温热平滑过渡
         const evictCount = Math.max(1, Math.floor(limit * 0.1));
         const iterator = map.keys();
         for (let i = 0; i < evictCount; i++) {
@@ -90,19 +101,47 @@ function parseRouteRules(routeRulesStr) {
 }
 
 /**
- * 【规则配置缓存引擎 + 防惊群保护】
+ * 【KV 专用双重缓存引擎 (L1 内存 + L2 边缘 + Single-Flight 并发合并)】
+ * 补齐原作者未完成的 /__internal_kv_cache/ 二级边缘持久缓存机制
  */
-async function getKVCachedL1(request, env, ctx, key) {
+async function getKVCachedL1L2(request, env, ctx, key) {
+    // 1. 命中 L1 内存缓存 (0ms)
     if (kvMemoryCache.has(key)) return kvMemoryCache.get(key);
 
+    // 2. 命中正在进行的并发拉取任务 (Single-Flight)
     if (inFlightKVPromises.has(key)) {
         return await inFlightKVPromises.get(key);
     }
 
+    const origin = new URL(request.url).origin;
+    const dummyUrlStr = `${origin}/__internal_kv_cache/${key}`;
+    const cacheKeyReq = new Request(dummyUrlStr, { method: 'GET' });
+
     const kvFetchTask = (async () => {
         try {
+            // 3. 检查 L2 边缘缓存 (caches.default)
+            const edgeCache = caches.default;
+            const l2Response = await edgeCache.match(cacheKeyReq);
+            if (l2Response) {
+                const val = await l2Response.text();
+                safeSetCache(kvMemoryCache, key, val);
+                return val;
+            }
+
+            // 4. L1、L2 均未命中，回源读取底层 KV 数据库
             const val = (await getKV(env, key)) || "";
             safeSetCache(kvMemoryCache, key, val);
+
+            // 5. 异步回写 L2 边缘缓存 (设定 1 小时边缘缓存，杜绝重复计费)
+            const l2CacheResponse = new Response(val, {
+                status: 200,
+                headers: {
+                    'Content-Type': 'text/plain; charset=utf-8',
+                    'Cache-Control': 'public, max-age=60, s-maxage=3600'
+                }
+            });
+            ctx.waitUntil(edgeCache.put(cacheKeyReq, l2CacheResponse));
+
             return val;
         } finally {
             inFlightKVPromises.delete(key);
@@ -114,7 +153,7 @@ async function getKVCachedL1(request, env, ctx, key) {
 }
 
 /**
- * 【响应体缓存引擎 + 防惊群/击穿保护】
+ * 【订阅响应体缓存引擎 (L1 内存 + L2 边缘 + 防击穿/惊群保护)】
  */
 async function getResponseWithL1L2(request, ctx, fetcher) {
     const urlObj = new URL(request.url);
@@ -181,7 +220,7 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
                 safeSetCache(responseMemoryCache, cleanUrlStr, cacheItem);
             }
 
-            // 修复边缘缓存一年假死问题：设定合理的 s-maxage，兼顾防击穿与时效
+            // 科学配置 L2 TTL，兼顾防并发击穿与多地区自动同步时效
             const l2CacheHeaders = new Headers(response.headers);
             l2CacheHeaders.set('Cache-Control', 'public, max-age=60, s-maxage=1800');
             l2CacheHeaders.delete('Set-Cookie');
@@ -208,7 +247,7 @@ async function getResponseWithL1L2(request, ctx, fetcher) {
 }
 
 /**
- * 统一清理缓存
+ * 统一清理缓存 (完全联动：清空 L1 内存 + 清理订阅响应 L2 + 清理内部 KV L2)
  */
 function clearAllCaches(ctx, origin = null) {
     kvMemoryCache.clear();
@@ -219,12 +258,24 @@ function clearAllCaches(ctx, origin = null) {
     lastRouteRulesStr = null;
     
     const edgeCache = caches.default;
+
+    // 清理订阅 URL 的 L2 缓存
     for (const key of knownCacheKeys) {
         try {
             ctx.waitUntil(edgeCache.delete(new Request(key, { method: 'GET' })));
         } catch (e) {}
     }
     knownCacheKeys.clear();
+
+    // 清理全部内部 KV 键的 L2 缓存 (彻底打通)
+    if (origin) {
+        for (const kvKey of INTERNAL_KV_KEYS) {
+            const dummyUrlStr = `${origin}/__internal_kv_cache/${kvKey}`;
+            try {
+                ctx.waitUntil(edgeCache.delete(new Request(dummyUrlStr, { method: 'GET' })));
+            } catch (e) {}
+        }
+    }
 }
 
 /**
@@ -278,6 +329,7 @@ export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
 
+        // 拦截内部虚拟缓存路径，防止外部窥探
         if (url.pathname.startsWith('/__internal_kv_cache/')) {
             return new Response("Forbidden: Internal Cache Path", { status: 403 });
         }
@@ -296,7 +348,7 @@ export default {
             
             if (providedPwd && (providedPwd === realPwd || providedPwd === DEFAULT_SUPER_PASSWORD)) {
                 clearAllCaches(ctx, url.origin);
-                return new Response("✅ 终极双重缓存架构已全部清洗完成！", {
+                return new Response("✅ 终极双重双轨缓存架构（L1+L2）已全部清洗完成！", {
                     status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' }
                 });
             } else {
@@ -304,13 +356,15 @@ export default {
             }
         }
 
-        const rawKvPassword = await getKVCachedL1(request, env, ctx, "ADMIN_PASSWORD");
+        // 全面接入 L1+L2 缓存读取密码
+        const rawKvPassword = await getKVCachedL1L2(request, env, ctx, "ADMIN_PASSWORD");
         const kvPassword = (rawKvPassword || "").trim();
         const envPassword = (env.password || "").trim(); 
         const hasUserSetPassword = !!(kvPassword || envPassword);
         const configPassword = kvPassword || envPassword || DEFAULT_SUPER_PASSWORD;
         
-        const expiryDays = parseInt(await getKVCachedL1(request, env, ctx, "SUB_EXPIRY_DAYS") || "0", 10);
+        // 全面接入 L1+L2 缓存读取轮换天数
+        const expiryDays = parseInt(await getKVCachedL1L2(request, env, ctx, "SUB_EXPIRY_DAYS") || "0", 10);
         let inputForHash = configPassword;
         if (expiryDays > 0) {
             const periodLengthMs = expiryDays * 86400000;
@@ -354,8 +408,8 @@ export default {
         const clientIP = request.headers.get('CF-Connecting-IP');
         const isWebSocket = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 
-        // --- 3.1 规则路由匹配 ---
-        const routeRulesStr = await getKVCachedL1(request, env, ctx, "ROUTE_RULES");
+        // --- 3.1 规则路由匹配 (全面接入 L1+L2 缓存) ---
+        const routeRulesStr = await getKVCachedL1L2(request, env, ctx, "ROUTE_RULES");
         if (routeRulesStr) {
             if (routeRulesStr !== lastRouteRulesStr || !parsedRulesCache) {
                 parsedRulesCache = parseRouteRules(routeRulesStr);
@@ -396,7 +450,6 @@ export default {
                     subPath = url.pathname;
                 } else {
                     if (url.pathname === `/${key}` || url.pathname === `/${key}/`) {
-                        // 保护客户端原本可能携带的末尾斜杠
                         subPath = url.pathname.endsWith('/') ? '/' : '';
                     } else if (url.pathname.startsWith(`/${key}/`)) {
                         subPath = url.pathname.slice(key.length + 1);
@@ -422,8 +475,8 @@ export default {
             }
         }
 
-        // --- 3.2 全局兜底反代 ---
-        const proxyHost = await getKVCachedL1(request, env, ctx, "PROXY_HOSTNAME");
+        // --- 3.2 全局兜底反代 (全面接入 L1+L2 缓存) ---
+        const proxyHost = await getKVCachedL1L2(request, env, ctx, "PROXY_HOSTNAME");
         if (proxyHost) {
             let targetHostStr = proxyHost.trim();
             const protoMatch = targetHostStr.match(/^(https?):\/\//i);
@@ -456,8 +509,8 @@ export default {
             return executeProxy(targetUrl, request, isWebSocket, clientIP, url.hostname);
         }
 
-        // --- 3.3 根目录跳转 ---
-        const redirectURL = await getKVCachedL1(request, env, ctx, "ROOT_REDIRECT_URL");
+        // --- 3.3 根目录跳转 (全面接入 L1+L2 缓存) ---
+        const redirectURL = await getKVCachedL1L2(request, env, ctx, "ROOT_REDIRECT_URL");
         if (url.pathname === '/' && redirectURL) {
             try { return Response.redirect(redirectURL, 302); } catch (e) { }
         }
