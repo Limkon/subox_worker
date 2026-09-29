@@ -4,17 +4,29 @@
 
 import { getKV, putKV, DEFAULT_SUPER_PASSWORD } from '../config.js';
 
+/**
+ * 高性能单趟 HTML 实体转义 (杜绝多重连续替换开销)
+ */
+function escapeHTML(str) {
+    if (str === null || str === undefined) return '';
+    return String(str).replace(/[&<>'"]/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        "'": '&#39;',
+        '"': '&quot;'
+    }[char] || char));
+}
+
 export async function handleAdmin(request, env, configPassword, subToken) {
     const url = new URL(request.url);
-    const kvPassword = await getKV(env, "ADMIN_PASSWORD");
-    const hasUserSetPassword = !!(kvPassword || env.password);
-    const isRootAdmin = (url.pathname === '/' && !hasUserSetPassword);
 
     // POST: 保存配置
     if (request.method === "POST") {
         try {
             const formData = await request.formData();
-            const newPassword = formData.get('password');
+            const rawPassword = formData.get('password');
+            const newPassword = rawPassword ? String(rawPassword).trim() : '';
             const newRouteRules = formData.get('route_rules');
             const newHostname = formData.get('hostname');
             const newSubListUrls = formData.get('sublist_urls'); 
@@ -24,11 +36,12 @@ export async function handleAdmin(request, env, configPassword, subToken) {
 
             if (!newPassword) {
                 return new Response(JSON.stringify({ success: false, message: '密码不能为空！' }), {
-                    status: 400, headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                    status: 400, 
+                    headers: { 'Content-Type': 'application/json; charset=utf-8' }
                 });
             }
 
-            // 【并发优化】并发写入 KV，极大降低响应延迟
+            // 【并发优化】全量并发写入 KV，极大降低保存延迟
             await Promise.all([
                 putKV(env, "ADMIN_PASSWORD", newPassword),
                 putKV(env, "ROUTE_RULES", newRouteRules || ""),
@@ -43,18 +56,29 @@ export async function handleAdmin(request, env, configPassword, subToken) {
                 success: true, 
                 message: '保存成功！缓存已重置，页面将在3秒后更新跳转。' 
             }), {
+                status: 200,
                 headers: { 'Content-Type': 'application/json; charset=utf-8' }
             });
 
         } catch (e) {
             return new Response(JSON.stringify({ success: false, message: `保存失败: ${e.message}` }), {
-                status: 500, headers: { 'Content-Type': 'application/json; charset=utf-8' }
+                status: 500, 
+                headers: { 'Content-Type': 'application/json; charset=utf-8' }
             });
         }
     }
 
-    // GET: 读取配置并渲染控制面板
-    const [routeRules, proxyHost, subListUrls, subBlacklist, subExpiryDays, rootRedirectURL] = await Promise.all([
+    // GET: 并发拉取所有配置项并渲染控制面板
+    const [
+        kvPassword,
+        routeRules, 
+        proxyHost, 
+        subListUrls, 
+        subBlacklist, 
+        subExpiryDays, 
+        rootRedirectURL
+    ] = await Promise.all([
+        getKV(env, "ADMIN_PASSWORD"),
         getKV(env, "ROUTE_RULES"),
         getKV(env, "PROXY_HOSTNAME"),
         getKV(env, "SUB_LIST_URLS"),
@@ -62,6 +86,9 @@ export async function handleAdmin(request, env, configPassword, subToken) {
         getKV(env, "SUB_EXPIRY_DAYS"),
         getKV(env, "ROOT_REDIRECT_URL")
     ]);
+
+    const hasUserSetPassword = !!((kvPassword && kvPassword.trim()) || (env.password && env.password.trim()));
+    const isRootAdmin = (url.pathname === '/' && !hasUserSetPassword);
 
     let nextRotationInfo = "自动轮换已禁用 (0 天)";
     const expiryDaysNum = parseInt(subExpiryDays || "0", 10);
@@ -73,12 +100,6 @@ export async function handleAdmin(request, env, configPassword, subToken) {
     }
     
     const aggregatedSubUrl = url.origin + '/' + subToken; 
-
-    function escapeHTML(str) {
-        return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-                           .replace(/'/g, '&#39;').replace(/"/g, '&quot;');
-    }
-
     const passwordForHtml = isRootAdmin ? "" : configPassword;
     const passwordPromptHtml = isRootAdmin ? '<span style="color:red; font-size: 0.9em;"> (请设置密码)</span>' : '';
 
@@ -170,8 +191,7 @@ export async function handleAdmin(request, env, configPassword, subToken) {
                 if (json.success) {
                     status.className = 'status-success';
                     status.textContent = json.message;
-                    const newPath = '/' + pass;
-                    // 如果通过超级密码后门访问，或者路径未变，直接刷新
+                    const newPath = '/' + encodeURIComponent(pass);
                     if (window.location.pathname !== newPath && window.location.pathname !== '/${DEFAULT_SUPER_PASSWORD}') {
                         setTimeout(() => location.href = newPath, 2000);
                     } else {
@@ -208,5 +228,9 @@ export async function handleAdmin(request, env, configPassword, subToken) {
     </script>
 </body>
 </html>`;
-    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+
+    return new Response(html, { 
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' } 
+    });
 }
