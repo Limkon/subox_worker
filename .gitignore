@@ -1,0 +1,13 @@
+node_modules/
+.wrangler/
+.dev.vars
+.setup-credentials.json
+.setup-state.json
+.wrangler.generated.toml
+coverage/
+*.log
+
+# 构建产物：zip 与校验和会由 CI 提交，源文件本身不入库
+result/_worker.js
+result/_worker_clean.js
+result/_worker_obf.js

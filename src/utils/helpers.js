@@ -2,208 +2,246 @@
 // === 工具函数库：src/utils/helpers.js ===
 // =================================================================
 
-import { CHUNK_SIZE } from '../config.js';
+import { CHUNK_SIZE, LIMITS } from '../config.js';
 
-/**
- * UTF-8 安全的高性能 Base64 编码 (分块防止堆栈溢出)
- * @param {string} str 待编码字符串
- * @returns {string} Base64 字符串
- */
+const encoder = new TextEncoder();
+const decoder = new TextDecoder('utf-8', { fatal: false });
+
+/** UTF-8 安全的 Base64 编码（分块防止堆栈溢出） */
 export function safeBase64Encode(str) {
     if (!str) return '';
-    const bytes = new TextEncoder().encode(str);
+    const bytes = encoder.encode(String(str));
     const chunkSize = CHUNK_SIZE || 8192;
     let binString = '';
-    
     for (let i = 0; i < bytes.length; i += chunkSize) {
         binString += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
     }
-    
     return btoa(binString);
 }
 
-/**
- * UTF-8 安全的高性能 Base64 解码 (消灭高频闭包开销，防御非法字符崩溃)
- * @param {string} base64Str 待解码 Base64 字符串
- * @returns {string} 解码后 UTF-8 字符串
- */
+/** UTF-8 安全的 Base64 解码（容错，不抛 DOMException） */
 export function safeBase64Decode(base64Str) {
     if (!base64Str || typeof base64Str !== 'string') return '';
-    
     try {
-        // 1. 清除所有空白字符 (\r, \n, \t, 空格) 并替换 URL 安全字符
         let clean = base64Str.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
-        
-        // 2. 准确计算并补齐 Base64 Padding (=)
         const remainder = clean.length % 4;
-        if (remainder === 2) {
-            clean += '==';
-        } else if (remainder === 3) {
-            clean += '=';
-        } else if (remainder === 1) {
-            clean = clean.substring(0, clean.length - 1);
-        }
-        
-        // 3. 安全原生二进制解码
+        if (remainder === 2) clean += '==';
+        else if (remainder === 3) clean += '=';
+        else if (remainder === 1) return ''; // 长度 1 的尾块一定非法，直接放弃
+
         const binString = atob(clean);
         const len = binString.length;
-        
-        // 4. 采用无闭包的原生循环填充 Uint8Array，相比 Array.from 提升 30 倍性能
         const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            bytes[i] = binString.charCodeAt(i);
-        }
-        
-        return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+        for (let i = 0; i < len; i++) bytes[i] = binString.charCodeAt(i);
+        return decoder.decode(bytes);
     } catch (e) {
-        // 容错返回空字符串，杜绝未捕获 DOMException 导致 Worker 崩溃
         return '';
     }
 }
 
-/**
- * 带有超时和单次重试的快速 fetch
- * @param {string} url 目标请求地址
- * @param {number} retries 重试次数
- * @param {number} timeout 超时毫秒数
- * @returns {Promise<Response>}
- */
-export async function fetchWithRetry(url, retries = 1, timeout = 6000) { 
-    const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    };
-    
-    for (let i = 0; i <= retries; i++) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeout);
-        try {
-            const response = await fetch(url, { signal: controller.signal, headers });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return response;
-        } catch (error) {
-            if (i === retries) throw error;
-            await new Promise(r => setTimeout(r, 400));
-        } finally {
-            clearTimeout(timeoutId);
-        }
-    }
-}
-
-/**
- * SHA-1 哈希算法
- * @param {string} str 输入字符串
- * @returns {Promise<string>} 40 位十六进制哈希
- */
-export async function sha1(str) {
-    const buffer = new TextEncoder().encode(str);
-    const hashBuffer = await crypto.subtle.digest('SHA-1', buffer);
-    return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-/**
- * 通配符转换为正则表达式
- * @param {string} wildcard 通配符字符串
- * @returns {RegExp|null}
- */
-export function wildcardToRegex(wildcard) {
-    try {
-        const cleanWildcard = (wildcard || '').trim();
-        if (!cleanWildcard) return null;
-        const escaped = cleanWildcard.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
-        return new RegExp(escaped.replace(/\*/g, '.*'), 'i');
-    } catch (e) {
-        return null;
-    }
-}
-
-/**
- * 构建复合合并黑名单正则 (将多条规则合并编译，实现单次扫描极速过滤)
- * @param {string} blacklistKeywordsRaw 原始黑名单配置文本
- * @returns {RegExp|null}
- */
-export function buildCombinedBlacklistRegex(blacklistKeywordsRaw) {
-    if (!blacklistKeywordsRaw || typeof blacklistKeywordsRaw !== 'string') return null;
-    
-    const patterns = blacklistKeywordsRaw
-        .split(/[\n,，;；]/)
-        .map(k => k.trim())
-        .filter(k => k.length > 0)
-        .map(k => {
-            try {
-                return k.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-            } catch (e) {
-                return null;
-            }
-        })
-        .filter(Boolean);
-
-    if (patterns.length === 0) return null;
-    try {
-        return new RegExp(`(?:${patterns.join('|')})`, 'i');
-    } catch (e) {
-        return null;
-    }
-}
-
-/**
- * 多层嵌套 URLDecode 安全解码
- * @param {string} str 待解码 URL 字符串
- * @returns {string} 解码后纯文本
- */
+/** 多层嵌套 URLDecode 安全解码 */
 export function fullDecode(str) {
     if (!str) return '';
-    let last = str, current = str, i = 0;
+    let last = String(str), current = last, i = 0;
     while (i < 3) {
         try {
             current = decodeURIComponent(last);
             if (current === last) break;
             last = current;
-        } catch (e) { 
-            break; 
+        } catch (e) {
+            break;
         }
         i++;
     }
     return current;
 }
 
-/**
- * 黑名单过滤检查 (双重兼容：支持单个复合 RegExp 或 RegExp 数组)
- * @param {string} nodeString 节点链接字符串
- * @param {RegExp[]|RegExp} blacklistFilter 正则数组或单一复合正则
- * @returns {boolean} 是否命中黑名单
- */
-export function isBlacklisted(nodeString, blacklistFilter) {
-    if (!blacklistFilter || !nodeString) return false;
-    
-    const testString = fullDecode(nodeString);
+/** 恒定时间字符串比较（不短路，避免时序侧信道） */
+export function constantTimeEqual(a, b) {
+    const x = String(a ?? '');
+    const y = String(b ?? '');
+    let diff = x.length ^ y.length;
+    const n = Math.max(x.length, y.length);
+    for (let i = 0; i < n; i++) {
+        diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);
+    }
+    return diff === 0;
+}
 
-    const matches = (target) => {
-        if (blacklistFilter instanceof RegExp) {
-            return blacklistFilter.test(target);
-        }
-        if (Array.isArray(blacklistFilter)) {
-            for (let i = 0; i < blacklistFilter.length; i++) {
-                if (blacklistFilter[i] && blacklistFilter[i].test(target)) return true;
+/** SHA-256 十六进制摘要（用于不可枚举的缓存键），len 为保留的 hex 字符数 */
+export async function sha256Hex(str, len = 32) {
+    const buf = await crypto.subtle.digest('SHA-256', encoder.encode(String(str)));
+    return Array.from(new Uint8Array(buf))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('')
+        .slice(0, Math.max(8, Math.min(64, len)));
+}
+
+// HMAC key 缓存，避免每个请求都 importKey
+const hmacKeyCache = new Map();
+
+async function getHmacKey(secret) {
+    if (hmacKeyCache.has(secret)) return hmacKeyCache.get(secret);
+    const key = await crypto.subtle.importKey(
+        'raw', encoder.encode(String(secret)),
+        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    );
+    if (hmacKeyCache.size >= 8) hmacKeyCache.clear();
+    hmacKeyCache.set(secret, key);
+    return key;
+}
+
+/**
+ * 订阅 token：HMAC-SHA256 派生 128 bit（32 位 hex）。
+ * 替代原来「口令 SHA-1 前 6 位 = 24 bit」的可枚举 token。
+ */
+export async function deriveSubToken(secret, periodTag = '') {
+    const key = await getHmacKey(secret);
+    const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(`subox:sub:${periodTag}`));
+    return Array.from(new Uint8Array(sig))
+        .slice(0, 16)
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+}
+
+/** 流式读取文本并强制字节上限（防御超大响应体 OOM） */
+async function readTextWithLimit(response, maxBytes) {
+    const declared = Number(response.headers?.get?.('Content-Length') || '0');
+    if (Number.isFinite(declared) && declared > maxBytes) {
+        throw new Error('upstream response too large');
+    }
+    if (!response.body || typeof response.body.getReader !== 'function') {
+        const text = await response.text();
+        if (text.length > maxBytes) throw new Error('upstream response too large');
+        return text;
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > maxBytes) {
+                await reader.cancel().catch(() => {});
+                throw new Error('upstream response too large');
             }
+            chunks.push(value);
         }
-        return false;
+    } finally {
+        reader.releaseLock?.();
+    }
+
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return decoder.decode(bytes);
+}
+
+/**
+ * 带超时 / 重试 / 响应体上限的文本抓取。
+ * 返回字符串，失败抛错由调用方决定是静默跳过还是记录。
+ */
+export async function fetchTextWithRetry(url, options = {}) {
+    const {
+        retries = 1,
+        timeout = 6000,
+        maxBytes = LIMITS.MAX_SUB_SOURCE_BYTES
+    } = options;
+    const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     };
 
-    // 1. 直接匹配节点链接（含 Hash 别名）
-    if (matches(testString)) return true;
-
-    // 2. 针对 vmess:// 协议深入提取 ps 字段匹配
-    if (testString.startsWith('vmess://')) {
+    let lastError = null;
+    for (let i = 0; i <= retries; i++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
         try {
-            const jsonString = safeBase64Decode(testString.substring(8));
+            const response = await fetch(url, { signal: controller.signal, headers });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const text = await readTextWithLimit(response, maxBytes);
+            return text;
+        } catch (error) {
+            lastError = error;
+            if (i === retries) break;
+            await new Promise(r => setTimeout(r, 300));
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+    throw lastError || new Error('fetch failed');
+}
+
+/**
+ * 构建线性时间黑名单匹配器。
+ *
+ * 原实现把 `*` 展开成 `.*` 再拼成单条正则，形如 (?:a.*a.*a.*b)，
+ * 对长字符串存在指数级回溯（实测 200 字符 >20s）。这里改为「按 * 分段 +
+ * 顺序 indexOf」的有界字面匹配，时间复杂度 O(输入长度 × 段数)，无回溯。
+ */
+export function buildBlacklistMatcher(blacklistKeywordsRaw) {
+    if (!blacklistKeywordsRaw || typeof blacklistKeywordsRaw !== 'string') return null;
+
+    const patterns = blacklistKeywordsRaw
+        .slice(0, LIMITS.MAX_BLACKLIST_BYTES)
+        .split(/[\n,，;；]/)
+        .map(k => k.trim().toLowerCase())
+        .filter(Boolean)
+        .slice(0, LIMITS.MAX_BLACKLIST_RULES)
+        .map(k => k.slice(0, LIMITS.MAX_BLACKLIST_RULE_LENGTH))
+        .map(k => k.split('*').filter(Boolean));
+
+    if (patterns.length === 0) return null;
+
+    return {
+        patterns,
+        test(target) {
+            if (typeof target !== 'string' || !target) return false;
+            const s = target.toLowerCase().slice(0, LIMITS.MAX_NODE_LENGTH);
+            for (const segments of patterns) {
+                if (segments.length === 0) return true; // 单个 "*" 命中全部
+                let pos = 0;
+                let matched = true;
+                for (const segment of segments) {
+                    const idx = s.indexOf(segment, pos);
+                    if (idx === -1) { matched = false; break; }
+                    pos = idx + segment.length;
+                }
+                if (matched) return true;
+            }
+            return false;
+        }
+    };
+}
+
+/**
+ * 黑名单过滤：节点链接 + URL 解码后的文本 + vmess 的 ps 字段。
+ * 所有输入都先截断到 MAX_NODE_LENGTH，避免超长串放大开销。
+ */
+export function isBlacklisted(nodeString, matcher) {
+    if (!matcher || !nodeString) return false;
+
+    const node = String(nodeString).slice(0, LIMITS.MAX_NODE_LENGTH);
+    const decoded = fullDecode(node).slice(0, LIMITS.MAX_NODE_LENGTH);
+
+    if (matcher.test(node) || matcher.test(decoded)) return true;
+
+    if (/^vmess:\/\//i.test(decoded)) {
+        try {
+            const jsonString = safeBase64Decode(decoded.substring(8));
             if (jsonString) {
                 const vmessConfig = JSON.parse(jsonString);
                 if (vmessConfig && vmessConfig.ps) {
-                    const nodeName = fullDecode(String(vmessConfig.ps));
-                    if (matches(nodeName)) return true;
+                    const name = fullDecode(String(vmessConfig.ps)).slice(0, LIMITS.MAX_NODE_LENGTH);
+                    if (matcher.test(name)) return true;
                 }
             }
-        } catch (e) {}
+        } catch (e) { /* 非法 vmess 配置，忽略 */ }
     }
     return false;
 }

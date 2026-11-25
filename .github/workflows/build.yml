@@ -6,42 +6,54 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: worker-artifact
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
+      # 固定到不可变 commit SHA（actions/checkout v4.2.2）
       - name: Checkout repository
-        uses: actions/checkout@main   # ⬅️ 升级到 v6 (原生支持 Node 24，无警告)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
+      # 固定到不可变 commit SHA（actions/setup-node v4.1.0）
       - name: Setup Node.js
-        uses: actions/setup-node@main # ⬅️ 升级到 v5 (原生支持 Node 24，无警告)
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
         with:
-          node-version: 'x'
+          node-version: '22'
+          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install dependencies (locked)
+        run: npm ci
 
-      - name: Build worker
-        run: npm run build
+      # 构建 + 语法校验 + 43 个单元测试 + 真实 workerd 运行时测试
+      - name: Verify (build / tests / workerd runtime)
+        run: npm run verify
 
-      - name: Zip output
-        # esbuild 已经直接将文件输出到了 result/_worker.js，这里不再需要 mv 命令，直接打包即可
+      - name: Package artifact
         run: |
           cd result
-          zip _worker.zip _worker.js
+          sha256sum _worker.js > _worker.js.sha256
+          rm -f _worker.zip
+          zip -j _worker.zip _worker.js
 
-    # - name: Upload worker artifact
-    #   uses: actions/upload-artifact@v4
-    #   with:
-    #     name: worker-script
-    #     path: result/_worker.js # 路径已更新为 result 目录
-    #     retention-days: 5
+      - name: Verify packaged artifact
+        run: |
+          cd result
+          actual=$(unzip -p _worker.zip _worker.js | sha256sum | cut -d' ' -f1)
+          expected=$(cut -d' ' -f1 _worker.js.sha256)
+          test "$actual" = "$expected" || { echo "artifact hash mismatch"; exit 1; }
 
       - name: Commit and push result
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add result/_worker.zip
-          git commit -m "build: update worker script in result/ [skip ci]" || echo "No changes to commit"
-          git push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add result/_worker.zip result/_worker.js.sha256
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "build: update worker bundle in result/ [skip ci]"
+            git push
+          fi
