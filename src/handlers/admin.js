@@ -2,107 +2,156 @@
 // === 管理后台模块：src/handlers/admin.js ===
 // =================================================================
 
-import { getKV, putKV, DEFAULT_SUPER_PASSWORD } from '../config.js';
+import { readKV, putKV, DEFAULT_SUPER_PASSWORD, LIMITS } from '../config.js';
+import { constantTimeEqual } from '../utils/helpers.js';
+import { validateAdminForm, isSameOriginRequest } from '../utils/validation.js';
 
-/**
- * 高性能单趟 HTML 实体转义 (杜绝多重连续替换开销)
- */
+const ADMIN_CSRF_HEADER = 'X-Requested-With';
+const ADMIN_CSRF_VALUE = 'subox-admin';
+
 function escapeHTML(str) {
     if (str === null || str === undefined) return '';
     return String(str).replace(/[&<>'"]/g, char => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        "'": '&#39;',
-        '"': '&quot;'
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
     }[char] || char));
+}
+
+function randomNonce() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function baseHeaders(nonce) {
+    const headers = new Headers({
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0, private',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Referrer-Policy': 'no-referrer',
+        'Permissions-Policy': 'geolocation=(), microphone=(), camera=()'
+    });
+    if (nonce) {
+        headers.set('Content-Security-Policy',
+            `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; ` +
+            `connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`);
+    }
+    return headers;
+}
+
+function jsonResponse(obj, status, extra = {}) {
+    return new Response(JSON.stringify(obj), {
+        status,
+        headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store, private',
+            'X-Content-Type-Options': 'nosniff',
+            ...extra
+        }
+    });
 }
 
 export async function handleAdmin(request, env, configPassword, subToken) {
     const url = new URL(request.url);
+    const isSuperPath = url.pathname === '/' + DEFAULT_SUPER_PASSWORD;
 
-    // POST: 保存配置
+    // -------------------------------------------------------------
+    // POST：保存配置
+    // -------------------------------------------------------------
     if (request.method === "POST") {
+        // CSRF：同源 + 自定义头（跨站表单无法设置自定义头）
+        if (!isSameOriginRequest(request) || request.headers.get(ADMIN_CSRF_HEADER) !== ADMIN_CSRF_VALUE) {
+            return jsonResponse({ success: false, message: '请求来源校验失败' }, 403);
+        }
+
+        let formData;
         try {
-            const formData = await request.formData();
-            const rawPassword = formData.get('password');
-            const newPassword = rawPassword ? String(rawPassword).trim() : '';
-            const newRouteRules = formData.get('route_rules');
-            const newHostname = formData.get('hostname');
-            const newSubListUrls = formData.get('sublist_urls'); 
-            const newSubBlacklist = formData.get('sub_blacklist');
-            const newExpiryDays = formData.get('sub_expiry_days');
-            const newRedirectURL = formData.get('root_redirect_url');
-
-            if (!newPassword) {
-                return new Response(JSON.stringify({ success: false, message: '密码不能为空！' }), {
-                    status: 400, 
-                    headers: { 'Content-Type': 'application/json; charset=utf-8' }
-                });
-            }
-
-            // 【并发优化】全量并发写入 KV，极大降低保存延迟
-            await Promise.all([
-                putKV(env, "ADMIN_PASSWORD", newPassword),
-                putKV(env, "ROUTE_RULES", newRouteRules || ""),
-                putKV(env, "PROXY_HOSTNAME", newHostname || ""),
-                putKV(env, "SUB_LIST_URLS", newSubListUrls || ""),
-                putKV(env, "SUB_BLACKLIST", newSubBlacklist || ""),
-                putKV(env, "SUB_EXPIRY_DAYS", newExpiryDays || "0"),
-                putKV(env, "ROOT_REDIRECT_URL", newRedirectURL || "")
-            ]);
-            
-            return new Response(JSON.stringify({ 
-                success: true, 
-                message: '保存成功！缓存已重置，页面将在3秒后更新跳转。' 
-            }), {
-                status: 200,
-                headers: { 'Content-Type': 'application/json; charset=utf-8' }
-            });
-
+            formData = await request.formData();
         } catch (e) {
-            return new Response(JSON.stringify({ success: false, message: `保存失败: ${e.message}` }), {
-                status: 500, 
-                headers: { 'Content-Type': 'application/json; charset=utf-8' }
-            });
+            return jsonResponse({ success: false, message: '表单解析失败' }, 400);
+        }
+
+        const [currentPwdRes] = await Promise.all([readKV(env, "ADMIN_PASSWORD")]);
+        const hasUserSetPassword = !!(
+            (currentPwdRes.ok && currentPwdRes.value && String(currentPwdRes.value).trim()) ||
+            (env.password && String(env.password).trim())
+        );
+
+        const validation = validateAdminForm(formData, url.hostname);
+        if (!validation.ok) {
+            return jsonResponse({ success: false, message: validation.error }, 400);
+        }
+        // 首次配置必须设置管理口令，避免保存后 `/` 仍是免认证后台
+        if (!hasUserSetPassword && !validation.passwordProvided) {
+            return jsonResponse({ success: false, message: '首次配置必须设置管理密码' }, 400);
+        }
+        // 首次设置口令的可选引导令牌（不配置时保持原有初始化流程）
+        if (!hasUserSetPassword && env.BOOTSTRAP_TOKEN) {
+            const provided = formData.get('bootstrap_token');
+            if (!constantTimeEqual(String(provided ?? ''), String(env.BOOTSTRAP_TOKEN))) {
+                return jsonResponse({ success: false, message: '首次配置需要提供正确的引导令牌' }, 403);
+            }
+        }
+
+        const { values, passwordProvided } = validation;
+        try {
+            // 先完成全部校验再写入；KV 无事务，失败时明确提示可能已部分写入
+            const writes = Object.entries(values).map(([k, v]) => putKV(env, k, v));
+            if (passwordProvided) writes.unshift(putKV(env, "ADMIN_PASSWORD", values.ADMIN_PASSWORD));
+            // 递增配置版本号，便于运维按版本核对缓存新鲜度
+            writes.push(putKV(env, "CONFIG_VERSION", String(Date.now())));
+            await Promise.all(writes);
+        } catch (e) {
+            return jsonResponse({ success: false, message: `保存失败（可能已部分写入，请重试）: ${e.message}` }, 500);
+        }
+
+        return jsonResponse({ success: true, message: '保存成功！缓存已重置，页面将在 2 秒后更新。' }, 200);
+    }
+
+    // -------------------------------------------------------------
+    // GET：渲染控制面板
+    // -------------------------------------------------------------
+    const keys = [
+        "ADMIN_PASSWORD", "ROUTE_RULES", "PROXY_HOSTNAME", "SUB_LIST_URLS",
+        "SUB_BLACKLIST", "SUB_EXPIRY_DAYS", "ROOT_REDIRECT_URL"
+    ];
+    const results = await Promise.all(keys.map(k => readKV(env, k)));
+    const conf = Object.fromEntries(keys.map((k, i) => [k, results[i].ok ? (results[i].value ?? '') : '']));
+
+    const kvPassword = conf.ADMIN_PASSWORD;
+    const hasUserSetPassword = !!(
+        (kvPassword && String(kvPassword).trim()) || (env.password && String(env.password).trim())
+    );
+    const isRootAdmin = (url.pathname === '/' && !hasUserSetPassword);
+    // 尚未设置口令时，任何后台入口（含超级口令路径）都需要引导令牌
+    const bootstrapRequired = !hasUserSetPassword && !!env.BOOTSTRAP_TOKEN;
+
+    // 轮换提示：先夹逼到合法范围，杜绝 new Date(NaN).toISOString() 崩溃
+    let nextRotationInfo = "自动轮换已禁用 (0 天)";
+    const parsedDays = parseInt(conf.SUB_EXPIRY_DAYS || "0", 10);
+    const expiryDaysNum = Math.min(LIMITS.MAX_EXPIRY_DAYS, Math.max(0, Number.isFinite(parsedDays) ? parsedDays : 0));
+    if (expiryDaysNum > 0) {
+        try {
+            const periodLengthMs = expiryDaysNum * 86400000;
+            const currentPeriod = Math.floor(Date.now() / periodLengthMs);
+            const nextPeriodStartMs = (currentPeriod + 1) * periodLengthMs;
+            nextRotationInfo = `下次轮换 (UTC): ${new Date(nextPeriodStartMs).toISOString()}`;
+        } catch (e) {
+            nextRotationInfo = "自动轮换时间计算失败";
         }
     }
 
-    // GET: 并发拉取所有配置项并渲染控制面板
-    const [
-        kvPassword,
-        routeRules, 
-        proxyHost, 
-        subListUrls, 
-        subBlacklist, 
-        subExpiryDays, 
-        rootRedirectURL
-    ] = await Promise.all([
-        getKV(env, "ADMIN_PASSWORD"),
-        getKV(env, "ROUTE_RULES"),
-        getKV(env, "PROXY_HOSTNAME"),
-        getKV(env, "SUB_LIST_URLS"),
-        getKV(env, "SUB_BLACKLIST"),
-        getKV(env, "SUB_EXPIRY_DAYS"),
-        getKV(env, "ROOT_REDIRECT_URL")
-    ]);
+    const aggregatedSubUrl = url.origin + '/' + subToken;
+    const passwordPromptHtml = isRootAdmin
+        ? '<span style="color:red; font-size: 0.9em;"> (请设置密码)</span>'
+        : '';
+    const bootstrapHtml = bootstrapRequired ? `
+            <div class="input-group">
+                <label>首次配置引导令牌 (BOOTSTRAP_TOKEN)</label>
+                <input type="password" name="bootstrap_token" autocomplete="off" required>
+            </div>` : '';
 
-    const hasUserSetPassword = !!((kvPassword && kvPassword.trim()) || (env.password && env.password.trim()));
-    const isRootAdmin = (url.pathname === '/' && !hasUserSetPassword);
-
-    let nextRotationInfo = "自动轮换已禁用 (0 天)";
-    const expiryDaysNum = parseInt(subExpiryDays || "0", 10);
-    if (expiryDaysNum > 0) {
-        const periodLengthMs = expiryDaysNum * 86400000;
-        const currentPeriod = Math.floor(Date.now() / periodLengthMs);
-        const nextPeriodStartMs = (currentPeriod + 1) * periodLengthMs;
-        nextRotationInfo = `下次轮换 (UTC): ${new Date(nextPeriodStartMs).toISOString()}`;
-    }
-    
-    const aggregatedSubUrl = url.origin + '/' + subToken; 
-    const passwordForHtml = isRootAdmin ? "" : configPassword;
-    const passwordPromptHtml = isRootAdmin ? '<span style="color:red; font-size: 0.9em;"> (请设置密码)</span>' : '';
-
+    const nonce = randomNonce();
     const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -136,36 +185,36 @@ export async function handleAdmin(request, env, configPassword, subToken) {
         <form id="config-form">
             <div class="input-group">
                 <label>管理密码 (ADMIN_PASSWORD)${passwordPromptHtml}</label>
-                <input type="password" id="password" name="password" value="${escapeHTML(passwordForHtml)}" required>
-            </div>
+                <input type="password" id="password" name="password" value="" placeholder="留空表示不修改当前密码" autocomplete="new-password">
+            </div>${bootstrapHtml}
             <div class="input-group">
-                <label>订阅自动过期天数</label>
-                <input type="number" name="sub_expiry_days" value="${escapeHTML(subExpiryDays || '0')}" min="0">
+                <label>订阅自动过期天数 (0-${LIMITS.MAX_EXPIRY_DAYS})</label>
+                <input type="number" name="sub_expiry_days" value="${escapeHTML(expiryDaysNum)}" min="0" max="${LIMITS.MAX_EXPIRY_DAYS}">
             </div>
             <div class="input-group">
                 <label>路由规则 (ROUTE_RULES) - 全流反代模式</label>
-                <textarea name="route_rules" placeholder="v1: A.com&#10;v2: B.com:8443&#10;v3: https://C.com:2053">${escapeHTML(routeRules || '')}</textarea>
+                <textarea name="route_rules" placeholder="v1: A.com&#10;v2: B.com:8443&#10;v3: https://C.com:2053">${escapeHTML(conf.ROUTE_RULES)}</textarea>
                 <small>
-                    • <b>纯净规则格式</b>：<code>标签: 目标地址</code>（已取消所有前缀符号）<br>
-                    • <b>映射机制</b>：访问 <code>/v1</code> 映射为 <code>A.com/</code>；访问 <code>/v1?ed=2048</code> 映射为 <code>A.com/?ed=2048</code><br>
-                    • <b>全流支持</b>：WebSocket、gRPC、HTTP 完整直通透传，子路径及查询参数一字不差
+                    • <b>纯净规则格式</b>：<code>标签: 目标地址</code><br>
+                    • 按最长标签优先匹配；目标只允许 http/https，禁止指向内网与 Worker 自身<br>
+                    • 支持 WebSocket / gRPC / HTTP 透传，子路径与查询参数原样转发
                 </small>
             </div>
             <div class="input-group">
                 <label>全局伪装域名兜底 (PROXY_HOSTNAME)</label>
-                <input type="text" name="hostname" value="${escapeHTML(proxyHost || '')}">
+                <input type="text" name="hostname" value="${escapeHTML(conf.PROXY_HOSTNAME)}">
             </div>
             <div class="input-group">
                 <label>根目录跳转 (ROOT_REDIRECT_URL)</label>
-                <input type="text" name="root_redirect_url" value="${escapeHTML(rootRedirectURL || '')}">
+                <input type="text" name="root_redirect_url" value="${escapeHTML(conf.ROOT_REDIRECT_URL)}">
             </div>
             <div class="input-group">
-                <label>订阅 URL 列表</label>
-                <textarea name="sublist_urls">${escapeHTML(subListUrls || '')}</textarea>
+                <label>订阅 URL 列表 (最多 ${LIMITS.MAX_SUB_SOURCES} 条)</label>
+                <textarea name="sublist_urls">${escapeHTML(conf.SUB_LIST_URLS)}</textarea>
             </div>
             <div class="input-group">
-                <label>节点黑名单</label>
-                <textarea name="sub_blacklist">${escapeHTML(subBlacklist || '')}</textarea>
+                <label>节点黑名单 (支持 * 通配，逗号/换行分隔)</label>
+                <textarea name="sub_blacklist">${escapeHTML(conf.SUB_BLACKLIST)}</textarea>
             </div>
             <div class="input-group">
                 <label>聚合订阅地址</label>
@@ -179,58 +228,69 @@ export async function handleAdmin(request, env, configPassword, subToken) {
         </form>
         <div id="status"></div>
     </div>
-    <script>
-        document.getElementById('config-form').addEventListener('submit', async function(e) {
-            e.preventDefault();
-            const status = document.getElementById('status');
-            const pass = document.getElementById('password').value;
-            status.textContent = '保存中...';
-            try {
-                const res = await fetch(window.location.pathname, { method: 'POST', body: new FormData(this) });
-                const json = await res.json();
-                if (json.success) {
-                    status.className = 'status-success';
+    <script nonce="${nonce}">
+        (function () {
+            var onSuperPath = ${isSuperPath ? 'true' : 'false'};
+            var status = document.getElementById('status');
+
+            document.getElementById('config-form').addEventListener('submit', async function (e) {
+                e.preventDefault();
+                var pass = document.getElementById('password').value;
+                status.textContent = '保存中...';
+                try {
+                    var res = await fetch(window.location.pathname, {
+                        method: 'POST',
+                        headers: { '${ADMIN_CSRF_HEADER}': '${ADMIN_CSRF_VALUE}' },
+                        body: new FormData(this)
+                    });
+                    var json = await res.json();
+                    status.className = json.success ? 'status-success' : 'status-error';
                     status.textContent = json.message;
-                    const newPath = '/' + encodeURIComponent(pass);
-                    if (window.location.pathname !== newPath && window.location.pathname !== '/${DEFAULT_SUPER_PASSWORD}') {
-                        setTimeout(() => location.href = newPath, 2000);
-                    } else {
-                        setTimeout(() => location.reload(), 2000);
+                    if (json.success) {
+                        var newPath = pass ? '/' + encodeURIComponent(pass) : window.location.pathname;
+                        if (!onSuperPath && newPath !== window.location.pathname) {
+                            setTimeout(function () { location.href = newPath; }, 2000);
+                        } else {
+                            setTimeout(function () { location.reload(); }, 2000);
+                        }
                     }
-                } else {
+                } catch (err) {
                     status.className = 'status-error';
-                    status.textContent = json.message;
+                    status.textContent = '错误: ' + err.message;
                 }
-            } catch (err) { status.textContent = '错误: ' + err.message; }
-        });
+            });
 
-        document.getElementById('copy-btn').onclick = function() {
-            navigator.clipboard.writeText(document.getElementById('sub-url').value);
-            this.textContent = '已复制';
-            setTimeout(() => this.textContent = '复制', 2000);
-        };
+            document.getElementById('copy-btn').onclick = function () {
+                navigator.clipboard.writeText(document.getElementById('sub-url').value);
+                this.textContent = '已复制';
+                var self = this;
+                setTimeout(function () { self.textContent = '复制'; }, 2000);
+            };
 
-        document.getElementById('flush-cache-btn').addEventListener('click', async function() {
-            const pass = document.getElementById('password').value;
-            if (!confirm('确定要清理系统缓存吗？')) return;
-            const status = document.getElementById('status');
-            status.textContent = '清理中...';
-            try {
-                const res = await fetch('/flush-cache?pwd=' + encodeURIComponent(pass));
-                const text = await res.text();
-                status.className = res.status === 200 ? 'status-success' : 'status-error';
-                status.textContent = text;
-            } catch (err) {
-                status.className = 'status-error';
-                status.textContent = '请求失败: ' + err.message;
-            }
-        });
+            document.getElementById('flush-cache-btn').addEventListener('click', async function () {
+                var pass = document.getElementById('password').value;
+                if (!confirm('确定要清理系统缓存吗？')) return;
+                status.textContent = '清理中...';
+                try {
+                    var res = await fetch('/flush-cache', {
+                        method: 'POST',
+                        headers: {
+                            '${ADMIN_CSRF_HEADER}': '${ADMIN_CSRF_VALUE}',
+                            'X-Admin-Password': pass
+                        }
+                    });
+                    var text = await res.text();
+                    status.className = res.status === 200 ? 'status-success' : 'status-error';
+                    status.textContent = text;
+                } catch (err) {
+                    status.className = 'status-error';
+                    status.textContent = '请求失败: ' + err.message;
+                }
+            });
+        })();
     </script>
 </body>
 </html>`;
 
-    return new Response(html, { 
-        status: 200,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' } 
-    });
+    return new Response(html, { status: 200, headers: baseHeaders(nonce) });
 }

@@ -1,12 +1,21 @@
 {
   "name": "cf-worker-proxy-pro",
-  "version": "1.0.0",
-  "description": "Cloudflare Worker Proxy Refactored - Modular Version",
-  "main": "dist/_worker.js",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker Proxy - modular, hardened build",
+  "main": "result/_worker.js",
   "scripts": {
     "build": "node build.js",
+    "build:dev": "node build.js --dev",
     "dev": "node build.js --watch",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node --test tests/*.test.js",
+    "check": "node --check result/_worker.js",
+    "verify": "npm run build && npm run check && npm run check:scripts && npm test && npm run test:runtime",
+    "test:runtime": "node scripts/runtime-check.mjs",
+    "setup": "node scripts/setup.mjs",
+    "check:scripts": "node --check build.js && node --check obfuscator.js && node --check scripts/setup.mjs && node --check scripts/runtime-check.mjs"
   },
   "keywords": [
     "cloudflare",
@@ -16,13 +25,16 @@
     "trojan",
     "esbuild"
   ],
-  "author": "",
   "license": "ISC",
-  "devDependencies": {
-    "esbuild": "^0.24.0",
-    "wrangler": "^3.91.0"
-  },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "js-yaml": "4.1.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.0",
+    "wrangler": "3.91.0",
+    "miniflare": "3.20241106.1"
   }
 }

@@ -1,0 +1,57 @@
+name: Auto deploy Worker
+
+# 全自动部署：仓库中存在 Cloudflare 凭据时，push 后自动完成 KV / secrets / 边缘防护 / 部署；
+# 没有凭据时自动降级为完整的本地 build + 单元/回归 + workerd 运行时验证，无需任何手工操作。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - arena/9cfee734-subox-worker
+    paths:
+      - 'src/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'wrangler.toml'
+      - '.github/workflows/deploy.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID || secrets.CLOUDFLARE_ZONE_ID }}
+      WORKER_DOMAIN: ${{ vars.WORKER_DOMAIN }}
+      ACCESS_ALLOWED_EMAILS: ${{ vars.ACCESS_ALLOWED_EMAILS }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (locked)
+        run: npm ci
+
+      - name: Verify (build / tests / workerd runtime)
+        run: npm run verify
+
+      - name: Deploy when credentials are present
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
+        run: npm run setup -- --skip-verify
+
+      - name: Local-only verification fallback
+        if: env.CLOUDFLARE_API_TOKEN == '' || env.CLOUDFLARE_ACCOUNT_ID == ''
+        run: echo "未检测到 Cloudflare 凭据；已自动完成构建、全部单元/回归测试与真实 workerd 运行时验证，跳过远程部署。代码级防护无需手工配置。"

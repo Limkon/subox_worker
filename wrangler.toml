@@ -1,0 +1,25 @@
+# Cloudflare Workers 配置
+# 无需手工编辑：运行 `npm run setup` 会自动创建/复用 KV namespace，生成
+# gitignore 的 `.wrangler.generated.toml`，上传 secrets 并完成测试与部署。
+name = "subox-worker"
+main = "result/_worker.js"
+compatibility_date = "2024-11-06"
+
+# KV 绑定：代码里固定使用 env.host。id 由 setup 脚本自动填入。
+[[kv_namespaces]]
+binding = "host"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# 自定义域名 / 路由（可选）。若填写，setup 脚本会据此推导 Zone 并自动创建
+# WAF 与 Rate Limiting 规则；也可用 CLOUDFLARE_ZONE_ID / WORKER_DOMAIN 指定。
+# [[routes]]
+# pattern = "proxy.example.com"
+# custom_domain = true
+
+# 说明：
+# - 管理口令与 BOOTSTRAP_TOKEN 是 Worker secrets，由 setup 脚本通过
+#   `wrangler secret bulk` 上传，不写进仓库、也不放在 [vars] 里。
+# - 内置超级管理员口令保持为 src/config.js 中的
+#   DEFAULT_SUPER_PASSWORD（771571215.），无法关闭。
+# - 若部署时提供了 CLOUDFLARE_API_TOKEN + Zone，setup 会自动配置边缘防护；
+#   否则代码内建的分布式限流、CSRF 校验与 /__subox/* 403 仍然生效。

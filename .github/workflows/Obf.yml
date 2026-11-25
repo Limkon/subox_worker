@@ -1,46 +1,69 @@
 name: ObfB-build Worker
 
+# 可选的「Unicode 降维」混淆构建。产物使用独立文件名，避免与 build.yml 覆盖同一个 zip。
+# 注意：\uXXXX 转义是可逆的代码混淆，不是安全边界。
 on:
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: worker-artifact
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
-        uses: actions/checkout@main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Setup Node.js
-        uses: actions/setup-node@main
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
         with:
-          node-version: 'x'
+          node-version: '22'
+          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install dependencies (locked)
+        run: npm ci
 
-      - name: Build worker
-        run: npm run build
+      # 构建 + 语法校验 + 单元/回归测试 + 真实 workerd 运行时测试（明文产物）
+      - name: Verify source bundle
+        run: npm run verify
 
-      # 调用 Node.js 版本的混淆脚本，并在原目录下完成新旧文件替换
       - name: Obfuscate worker
         run: |
-          node obfuscator.js result/_worker.js
-          rm result/_worker.js
-          mv result/_worker_clean.js result/_worker.js
+          node obfuscator.js result/_worker.js result/_worker_obf.js
+          mv result/_worker_obf.js result/_worker.js
+          node --check result/_worker.js
 
-      - name: Zip output
+      # 对混淆后的产物再跑一次真实 workerd 运行时验证
+      - name: Runtime check obfuscated bundle
+        run: npm run test:runtime
+
+      - name: Package obfuscated artifact
         run: |
           cd result
-          zip _worker.zip _worker.js
+          sha256sum _worker.js > _worker_obf.js.sha256
+          rm -f _worker_obf.zip
+          zip -j _worker_obf.zip _worker.js
+
+      - name: Verify packaged artifact
+        run: |
+          cd result
+          actual=$(unzip -p _worker_obf.zip _worker.js | sha256sum | cut -d' ' -f1)
+          expected=$(cut -d' ' -f1 _worker_obf.js.sha256)
+          test "$actual" = "$expected" || { echo "artifact hash mismatch"; exit 1; }
 
       - name: Commit and push result
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add result/_worker.zip
-          git commit -m "build: update worker script in result/ [skip ci]" || echo "No changes to commit"
-          git push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add result/_worker_obf.zip result/_worker_obf.js.sha256
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "build: update obfuscated worker bundle in result/ [skip ci]"
+            git push
+          fi
