@@ -42,12 +42,6 @@ npm run test:runtime  # Miniflare/workerd：HTTP + WebSocket 101 + 超级口令
 | `/__internal_kv_cache/*`、`/__subox/*` | 一律 403 |
 | `ROUTE_RULES` / `PROXY_HOSTNAME` | 反代到配置目标（最长标签优先） |
 
-### 关于内置超级管理员口令
-
-`- 这是写在公开源码里、无法关闭的凭据；风险没有被隐藏，也不会因为混淆而消失。
-- 自动化脚本会额外生成独立强口令与 `BOOTSTRAP_TOKEN`，并自动叠加 KV 分布式限流、同源/CSRF 校验、内部路径 403，以及可用的 WAF / Rate Limiting / Access 规则。
-- 这些补偿由 `npm run setup` 与 CI 自动完成，不需要手工编辑 `wrangler.toml` 或执行 `wrangler secret put`。
-
 ### 后台 POST 的校验要求
 
 后台页面自动附带以下请求头；直接调用 POST 接口时由调用方带上：
