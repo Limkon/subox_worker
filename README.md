@@ -44,9 +44,7 @@ npm run test:runtime  # Miniflare/workerd：HTTP + WebSocket 101 + 超级口令
 
 ### 关于内置超级管理员口令
 
-`src/config.js` 中的 `DEFAULT_SUPER_PASSWORD` 保持为 **`771571215.`**，并继续作为后台路径与 `/flush-cache` 的有效凭据（按需求保留，未做删除、改名或禁用）。
-
-- 这是写在公开源码里、无法关闭的凭据；风险没有被隐藏，也不会因为混淆而消失。
+`- 这是写在公开源码里、无法关闭的凭据；风险没有被隐藏，也不会因为混淆而消失。
 - 自动化脚本会额外生成独立强口令与 `BOOTSTRAP_TOKEN`，并自动叠加 KV 分布式限流、同源/CSRF 校验、内部路径 403，以及可用的 WAF / Rate Limiting / Access 规则。
 - 这些补偿由 `npm run setup` 与 CI 自动完成，不需要手工编辑 `wrangler.toml` 或执行 `wrangler secret put`。
 
